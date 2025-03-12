@@ -1,0 +1,73 @@
+name: "CI"
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci-pass:
+    name: CI is green
+    runs-on: ubuntu-latest
+    needs:
+      - test-linux
+      - lint
+      - docs-check
+    steps:
+      - run: exit 0
+
+  lint:
+    runs-on: [self-hosted, Linux, amd64]
+
+    strategy:
+      matrix:
+        rust: [nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt,clippy
+          toolchain: ${{matrix.rust}}
+      - uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Format check
+        run: |
+          cargo fmt -- --check
+
+  docs-check:
+    runs-on: [self-hosted, Linux, amd64]
+
+    strategy:
+      matrix:
+        rust: [nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt,clippy
+          toolchain: ${{matrix.rust}}
+      - name: Docs check
+        run: |
+          cargo rustdoc --all-features -- --deny warnings
+
+  test-linux:
+    runs-on: [self-hosted, Linux, amd64]
+
+    strategy:
+      matrix:
+        rust: [nightly, stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          components: rustfmt,clippy
+          toolchain: ${{matrix.rust}}
+      - name: Run tests
+        run: |
+          cargo clippy --all-features -- --deny warnings
+          cargo test --all-features
