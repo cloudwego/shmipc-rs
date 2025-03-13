@@ -1,5 +1,14 @@
 # Shmipc
 
+[![Crates.io](https://img.shields.io/crates/v/shmipc)](https://crates.io/crates/shmipc)
+[![Documentation](https://docs.rs/shmipc/badge.svg)](https://docs.rs/shmipc)
+[![Website](https://img.shields.io/website?up_message=cloudwego&url=https%3A%2F%2Fwww.cloudwego.io%2F)](https://www.cloudwego.io/)
+[![License](https://img.shields.io/crates/l/shmipc)](#license)
+[![Build Status][actions-badge]][actions-url]
+
+[actions-badge]: https://github.com/cloudwego/shmipc-rs/actions/workflows/ci.yaml/badge.svg
+[actions-url]: https://github.com/cloudwego/shmipc-rs/actions
+
 [English](README.md) | 中文 
 
 ## 简介
