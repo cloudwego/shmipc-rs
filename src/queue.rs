@@ -132,7 +132,7 @@ impl QueueManager {
         let fi = file.metadata()?;
 
         let mapping_size = fi.len();
-        #[cfg(any(target_arch = "arm", target_arch = "arm64ec"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
         // a queueManager have two queue, a queue's head and tail should align to 8 byte boundary
         if mapping_size % 16 != 0 {
             return Err(anyhow!(
@@ -163,7 +163,7 @@ impl QueueManager {
         let fi = file.metadata()?;
 
         let mapping_size = fi.len();
-        #[cfg(any(target_arch = "arm", target_arch = "arm64ec"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
         // a queueManager have two queue, a queue's head and tail should align to 8 byte boundary
         if mapping_size % 16 != 0 {
             return Err(anyhow!(
@@ -246,7 +246,7 @@ impl Queue {
         let cap = unsafe { *(data as *mut u32) };
         let queue_start_offset = QUEUE_HEADER_LENGTH;
         let queue_end_offset = QUEUE_HEADER_LENGTH + QUEUE_ELEMENT_LEN * cap as usize;
-        #[cfg(any(target_arch = "arm", target_arch = "arm64ec"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
         unsafe {
             Queue {
                 cap: cap as i64,
@@ -255,10 +255,11 @@ impl Queue {
                 tail: data.offset(16) as *mut i64,
                 queue_bytes_on_memory: data.offset(queue_start_offset as isize) as *const u8,
                 len: queue_end_offset - queue_start_offset,
+                lock: Mutex::new(()),
             }
         }
         // TODO: unaligned head and tail
-        #[cfg(not(any(target_arch = "arm", target_arch = "arm64ec")))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "arm64ec")))]
         unsafe {
             Self {
                 cap: cap as i64,
