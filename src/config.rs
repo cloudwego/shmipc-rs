@@ -127,7 +127,7 @@ impl Config {
                 ));
             }
 
-            #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+            #[cfg(target_arch = "aarch64")]
             if pair.size % 4 != 0 {
                 return Err(anyhow!(
                     "the size_percent_pair.size must be a multiple of 4"
@@ -141,7 +141,7 @@ impl Config {
             ));
         }
 
-        #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+        #[cfg(target_arch = "aarch64")]
         if self.queue_cap % 8 != 0 {
             return Err(anyhow!("the queue_cap must be a multiple of 8"));
         }
@@ -155,11 +155,7 @@ impl Config {
             return Err(anyhow!("shmipc just support linux OS now"));
         }
 
-        #[cfg(not(any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "arm64ec"
-        )))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             return Err(anyhow!("shmipc just support amd64 or arm64 arch"));
         }
