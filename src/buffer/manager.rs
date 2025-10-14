@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::slice;
 use std::{
     collections::HashMap,
     ffi::CString,
     fs::{self, OpenOptions, Permissions},
     os::{
-        fd::{IntoRawFd, RawFd},
+        fd::{BorrowedFd, IntoRawFd, RawFd},
         raw::c_void,
         unix::prelude::PermissionsExt,
     },
     path::Path,
+    slice,
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicI32, Ordering},
@@ -99,7 +99,7 @@ impl BufferManager {
                 CString::new(format!("shmipc{}", buffer_path_name))
                     .expect("CString::new failed")
                     .as_c_str(),
-                nix::sys::memfd::MemFdCreateFlag::empty(),
+                nix::sys::memfd::MFdFlags::empty(),
             )
             .map_err(|err| anyhow!("BufferManager get_with_memfd memfd_create failed: {}", err))?;
             nix::unistd::ftruncate(&owned_fd, capacity as i64).map_err(|err| {
@@ -110,7 +110,7 @@ impl BufferManager {
             })?;
             memfd = owned_fd.into_raw_fd();
         } else {
-            let f_info = nix::sys::stat::fstat(memfd)
+            let f_info = nix::sys::stat::fstat(unsafe { BorrowedFd::borrow_raw(memfd) })
                 .map_err(|err| anyhow!("BufferManager get_with_memfd mapping failed: {}", err))?;
             capacity = f_info.st_size as u32;
         }
@@ -343,12 +343,12 @@ impl BufferManager {
 
 pub async fn add_global_buffer_manager_ref_count(path: &str, c: i32) {
     let bm = BUFFER_MANAGERS.lock().unwrap().remove(path);
-    if let Some(bm) = &bm {
-        if bm.ref_count.fetch_add(c, Ordering::SeqCst) + c <= 0 {
-            tracing::info!("clean buffer manager:{}", path);
-            bm.unmap().await;
-            return;
-        }
+    if let Some(bm) = &bm
+        && bm.ref_count.fetch_add(c, Ordering::SeqCst) + c <= 0
+    {
+        tracing::info!("clean buffer manager:{}", path);
+        bm.unmap().await;
+        return;
     }
     if let Some(bm) = bm {
         BUFFER_MANAGERS.lock().unwrap().insert(path.to_owned(), bm);

@@ -54,7 +54,7 @@ impl QueueManager {
             CString::new(format!("shmipc{}", queue_path_name))
                 .expect("CString::new failed")
                 .as_c_str(),
-            nix::sys::memfd::MemFdCreateFlag::empty(),
+            nix::sys::memfd::MFdFlags::empty(),
         )?;
 
         let mem_size = count_queue_mem_size(queue_cap) * QUEUE_COUNT;

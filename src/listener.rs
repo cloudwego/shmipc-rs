@@ -18,9 +18,14 @@ use std::{
 };
 
 use tokio::sync::mpsc;
-use volo::net::{Address, DefaultIncoming, MakeIncoming, incoming::Incoming};
 
-use crate::{config::Config, session::Session, stream::Stream};
+use crate::{
+    config::Config,
+    error::Error,
+    session::Session,
+    stream::Stream,
+    transport::{TransportListen, TransportListener, TransportStream},
+};
 
 #[derive(Debug)]
 pub struct Listener {
@@ -29,19 +34,20 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub async fn new(addr: impl Into<Address>, config: Config) -> anyhow::Result<Self> {
-        let addr = addr.into();
-        if let Address::Unix(socket) = &addr {
-            if let Some(path) = socket.as_pathname() {
-                if path.exists() {
-                    std::fs::remove_file(path)?;
-                }
-            }
-        }
-        let incoming = addr.make_incoming().await?;
+    pub async fn new<L>(listen: L, addr: L::Address, config: Config) -> Result<Self, Error>
+    where
+        L: TransportListen,
+        L::Listener: Send + 'static,
+        <L::Listener as TransportListener>::Stream: Send,
+        <<L::Listener as TransportListener>::Stream as TransportStream>::ReadHalf: Send + 'static,
+        <<L::Listener as TransportListener>::Stream as TransportStream>::WriteHalf: Send + 'static,
+        <L::Listener as TransportListener>::Address: Send,
+    {
+        let listener = listen.listen(addr).await?;
         let (tx, rx) = mpsc::unbounded_channel();
         let sessions = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(Self::accept_loop(incoming, config, tx, sessions.clone()));
+
+        tokio::spawn(Self::accept_loop(listener, config, tx, sessions.clone()));
         Ok(Self {
             stream_rx: rx,
             sessions,
@@ -52,42 +58,42 @@ impl Listener {
         self.stream_rx.recv().await.unwrap_or(Ok(None))
     }
 
-    async fn accept_loop(
-        mut incoming: DefaultIncoming,
+    async fn accept_loop<L>(
+        listener: L,
         config: Config,
         stream_tx: mpsc::UnboundedSender<io::Result<Option<Stream>>>,
         sessions: Arc<Mutex<Vec<Session>>>,
-    ) {
+    ) where
+        L: TransportListener,
+        <L::Stream as TransportStream>::ReadHalf: Send + 'static,
+        <L::Stream as TransportStream>::WriteHalf: Send + 'static,
+    {
         loop {
-            tokio::select! {
+            let res = tokio::select! {
+                res = listener.accept() => res,
                 _ = stream_tx.closed() => {
+                    tracing::warn!("[ShmIPC] session receiver is closed, shutdown listener");
                     return;
                 }
-                res = incoming.accept() => {
-                    match res {
-                        Ok(Some(conn)) => {
-                            let (tx, rx) = mpsc::channel::<Stream>(config.max_stream_num);
+            };
+            match res {
+                Ok((stream, _)) => {
+                    let (tx, rx) = mpsc::channel::<Stream>(config.max_stream_num);
 
-                            match Session::server(config.clone(), conn.stream, tx).await {
-                                Ok(session) => {
-                                    sessions.lock().unwrap().push(session.clone());
-                                    tokio::spawn(session.recv_loop(rx, stream_tx.clone()));
-                                }
-                                Err(err) => {
-                                    tracing::warn!("failed to create shmipc session: {}", err);
-                                    continue;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            _ = stream_tx.send(Ok(None));
-                            return;
+                    match Session::server(config.clone(), stream, tx).await {
+                        Ok(session) => {
+                            sessions.lock().unwrap().push(session.clone());
+                            tokio::spawn(session.recv_loop(rx, stream_tx.clone()));
                         }
                         Err(err) => {
-                            _ = stream_tx.send(Err(err));
-                            return;
+                            tracing::warn!("[ShmIPC] failed to create session, err: {err}");
+                            continue;
                         }
                     }
+                }
+                Err(err) => {
+                    _ = stream_tx.send(Err(err));
+                    return;
                 }
             }
         }

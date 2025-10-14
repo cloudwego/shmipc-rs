@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod buf_reader;
+
 /// Determine whether to create new share memory based on the current remaining share memory size.
 ///
 /// Currently, this only works on the /dev/shm partition of the Linux system. Other systems return

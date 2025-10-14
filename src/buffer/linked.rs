@@ -103,15 +103,15 @@ impl LinkedBuffer {
                 slice = s.next();
             }
             // recycle unused slice
-            if let Some(write_slice) = self.slice_list.write() {
-                if write_slice.next().is_some() {
-                    let head = self.slice_list.split_from_write();
-                    let mut slice = head;
-                    while let Some(s) = slice {
-                        let next = unsafe { s.next_slice.map(|s| *Box::from_raw(s.as_ptr())) };
-                        self.buffer_manager.recycle_buffer(s);
-                        slice = next;
-                    }
+            if let Some(write_slice) = self.slice_list.write()
+                && write_slice.next().is_some()
+            {
+                let head = self.slice_list.split_from_write();
+                let mut slice = head;
+                while let Some(s) = slice {
+                    let next = unsafe { s.next_slice.map(|s| *Box::from_raw(s.as_ptr())) };
+                    self.buffer_manager.recycle_buffer(s);
+                    slice = next;
                 }
             }
         }
@@ -224,13 +224,13 @@ impl LinkedBuffer {
     }
 
     fn read_next_slice(&mut self) {
-        if let Some(slice) = self.slice_list.pop_front() {
-            if slice.is_from_shm {
-                if self.current_pinned {
-                    self.pinned_list.push_back(slice);
-                } else {
-                    self.buffer_manager.recycle_buffer(slice);
-                }
+        if let Some(slice) = self.slice_list.pop_front()
+            && slice.is_from_shm
+        {
+            if self.current_pinned {
+                self.pinned_list.push_back(slice);
+            } else {
+                self.buffer_manager.recycle_buffer(slice);
             }
         }
         self.current_pinned = false;
@@ -273,14 +273,14 @@ impl BufferReader for LinkedBuffer {
             self.read_next_slice();
         }
 
-        if let Some(slice) = self.slice_list.front_mut() {
-            if slice.size() >= size {
-                self.current_pinned = true;
-                self.len -= size;
-                // A workaround to avoid https://github.com/rust-lang/rust/issues/54663
-                let bytes = self.slice_list.front_mut().unwrap().read(size);
-                return Ok(Buf::Shm(bytes));
-            }
+        if let Some(slice) = self.slice_list.front_mut()
+            && slice.size() >= size
+        {
+            self.current_pinned = true;
+            self.len -= size;
+            // A workaround to avoid https://github.com/rust-lang/rust/issues/54663
+            let bytes = self.slice_list.front_mut().unwrap().read(size);
+            return Ok(Buf::Shm(bytes));
         }
         // slow path
         self.len -= size;

@@ -15,19 +15,23 @@
 // limitations under the License.
 
 mod buffer;
-pub use buffer::{BufferReader, BufferWriter};
-pub mod config;
-pub mod consts;
 mod error;
-pub use error::Error;
+mod listener;
 mod protocol;
 mod queue;
 mod session;
-pub use session::{config::SessionManagerConfig, manager::SessionManager};
 mod stream;
-pub use stream::{AsyncReadShm, AsyncWriteShm, Stream};
-mod listener;
-pub use listener::Listener;
-pub mod stats;
 mod util;
-pub use buffer::{linked::LinkedBuffer, slice::BufferSlice};
+
+pub mod config;
+pub mod consts;
+pub mod stats;
+pub mod transport;
+
+pub use self::{
+    buffer::{BufferReader, BufferWriter, linked::LinkedBuffer, slice::BufferSlice},
+    error::Error,
+    listener::Listener,
+    session::{config::SessionManagerConfig, manager::SessionManager},
+    stream::{AsyncReadShm, AsyncWriteShm, Stream},
+};

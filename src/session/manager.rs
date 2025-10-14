@@ -19,10 +19,14 @@ use std::sync::{
 
 use arc_swap::ArcSwap;
 use tokio::sync::Notify;
-use volo::net::Address;
 
 use super::{Session, config::SessionManagerConfig};
-use crate::{consts::StateType, error::Error, stream::Stream};
+use crate::{
+    consts::StateType,
+    error::Error,
+    stream::Stream,
+    transport::{TransportConnect, TransportStream},
+};
 
 const SESSION_ROUND_ROBIN_THRESHOLD: usize = 32;
 
@@ -37,16 +41,23 @@ const SESSION_ROUND_ROBIN_THRESHOLD: usize = 32;
 /// When the client needs to communicate with multiple server processes, a separate
 /// SessionManager should be maintained for each different server. At the same time,
 /// `queue_path` and `share_memory_path_prefix` need to be kept different.
-#[derive(Clone, Debug)]
-pub struct SessionManager {
-    inner: Arc<SessionManagerInner>,
+pub struct SessionManager<C: TransportConnect> {
+    inner: Arc<SessionManagerInner<C>>,
+}
+
+impl<C: TransportConnect> Clone for SessionManager<C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
-struct SessionManagerInner {
+struct SessionManagerInner<C: TransportConnect> {
     sm_config: SessionManagerConfig,
-    addr: Address,
+    connect: C,
+    addr: C::Address,
     sessions: Vec<ArcSwap<Session>>,
     count: AtomicUsize,
     epoch: u64,
@@ -55,23 +66,31 @@ struct SessionManagerInner {
     shutdown_tx: Arc<Notify>,
 }
 
-impl SessionManager {
+impl<C: TransportConnect> SessionManager<C>
+where
+    C: TransportConnect + Send + Sync + 'static,
+    C::Stream: Send,
+    <C::Stream as TransportStream>::ReadHalf: Send + 'static,
+    <C::Stream as TransportStream>::WriteHalf: Send + 'static,
+    C::Address: Clone + Send + Sync,
+{
     /// Create a new SessionManager.
     pub async fn new(
         mut sm_config: SessionManagerConfig,
-        addr: impl Into<Address>,
+        connect: C,
+        addr: C::Address,
     ) -> Result<Self, Error> {
         let mut sessions = Vec::with_capacity(sm_config.session_num());
-        let addr = addr.into();
 
         for i in 0..sm_config.session_num() {
-            let session = Session::client(i, 0, 0, &mut sm_config, &addr).await?;
+            let session = Session::client(i, 0, 0, &mut sm_config, &connect, addr.clone()).await?;
             sessions.push(ArcSwap::from_pointee(session));
         }
         let shutdown = Arc::new(Notify::new());
         let sm = Self {
             inner: Arc::new(SessionManagerInner {
                 sm_config: sm_config.clone(),
+                connect,
                 addr,
                 sessions,
                 count: AtomicUsize::new(0),
@@ -133,7 +152,7 @@ impl SessionManager {
                     loop {
                         tokio::time::sleep(self.inner.sm_config.config().rebuild_interval).await;
 
-                        match Session::client(i, 0, 0, &mut self.inner.sm_config.clone(), &self.inner.addr).await {
+                        match Session::client(i, 0, 0, &mut self.inner.sm_config.clone(), &self.inner.connect, self.inner.addr.clone()).await {
                             Ok(new_session) => {
                                 self.inner.sessions[i].store(Arc::new(new_session));
                                 tracing::info!("rebuild session {i} success");

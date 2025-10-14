@@ -17,7 +17,10 @@ use std::os::unix::net::SocketAddr;
 use criterion::{Criterion, criterion_group, criterion_main};
 use shmipc::{
     AsyncReadShm, AsyncWriteShm, BufferReader, BufferSlice, Error, LinkedBuffer, Listener,
-    SessionManager, SessionManagerConfig, Stream, config::SizePercentPair, consts::MemMapType,
+    SessionManager, SessionManagerConfig, Stream,
+    config::SizePercentPair,
+    consts::MemMapType,
+    transport::{DefaultUnixConnect, DefaultUnixListen},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -78,6 +81,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                         .push_str(rand.to_string().as_str());
                     sm_config = sm_config.with_session_num(1);
                     let mut server = Listener::new(
+                        DefaultUnixListen,
                         SocketAddr::from_pathname(path.clone()).unwrap(),
                         sm_config.config().clone(),
                     )
@@ -110,10 +114,13 @@ fn criterion_benchmark(c: &mut Criterion) {
                         }
                     });
 
-                    let client =
-                        SessionManager::new(sm_config, SocketAddr::from_pathname(path).unwrap())
-                            .await
-                            .unwrap();
+                    let client = SessionManager::new(
+                        sm_config,
+                        DefaultUnixConnect,
+                        SocketAddr::from_pathname(path).unwrap(),
+                    )
+                    .await
+                    .unwrap();
                     let mut handlers = Vec::with_capacity(200);
                     let start = Instant::now();
                     for _ in 0..199 {

@@ -18,9 +18,9 @@ use std::{
 };
 
 use anyhow::anyhow;
+use libc::EINVAL;
 use nix::{
     cmsg_space,
-    libc::EINVAL,
     sys::socket::{
         ControlMessage, ControlMessageOwned, MsgFlags, getsockopt, recvmsg, sendmsg,
         sockopt::SockType,
@@ -33,7 +33,11 @@ use crate::consts::MEMFD_COUNT;
 pub(crate) fn block_read_full(conn_fd: RawFd, data: &mut [u8]) -> Result<(), anyhow::Error> {
     let mut read_size = 0;
     while read_size < data.len() {
-        let n = read(conn_fd, &mut data[read_size..]).map_err(|e| {
+        let n = read(
+            unsafe { BorrowedFd::borrow_raw(conn_fd) },
+            &mut data[read_size..],
+        )
+        .map_err(|e| {
             anyhow!(
                 "read_full failed, had read_size:{read_size}, reason:{}",
                 e.desc()

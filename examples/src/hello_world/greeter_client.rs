@@ -14,7 +14,10 @@
 
 use std::os::unix::net::SocketAddr;
 
-use shmipc::{AsyncReadShm, AsyncWriteShm, SessionManager, SessionManagerConfig};
+use shmipc::{
+    AsyncReadShm, AsyncWriteShm, SessionManager, SessionManagerConfig,
+    transport::DefaultUnixConnect,
+};
 
 #[tokio::main]
 async fn main() {
@@ -31,7 +34,9 @@ async fn main() {
         conf.config.queue_path = "/tmp/client.ipc.shm_queue".to_string();
     }
 
-    let sm = SessionManager::new(conf, uds_path).await.unwrap();
+    let sm = SessionManager::new(conf, DefaultUnixConnect, uds_path)
+        .await
+        .unwrap();
     let mut stream = sm.get_stream().unwrap();
     let request_msg = "client say hello world!!!";
     println!(

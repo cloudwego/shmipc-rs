@@ -13,7 +13,6 @@
 // limitations under the License.
 
 pub mod config;
-pub mod ext;
 pub mod manager;
 pub mod pool;
 
@@ -28,21 +27,11 @@ use std::{
 
 use anyhow::anyhow;
 use config::SessionManagerConfig;
-use ext::ConnStreamExt;
-use motore::make::MakeConnection;
-use nix::libc;
+use futures::future::Either;
 use pool::StreamPool;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     sync::{Notify, mpsc, oneshot},
-};
-use volo::{
-    net::{
-        Address,
-        conn::{ConnStream, OwnedReadHalf, OwnedWriteHalf},
-        dial::{DefaultMakeTransport, MakeTransport},
-    },
-    util::buf_reader::BufReader,
 };
 
 use crate::{
@@ -61,6 +50,8 @@ use crate::{
     queue::QueueManager,
     stats::Stats,
     stream::{BufferSliceWrapper, STREAM_CLOSED, STREAM_OPENED, Stream},
+    transport::{TransportConnect, TransportStream},
+    util::buf_reader::BufReader,
 };
 
 static BUF_READER_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
@@ -102,7 +93,7 @@ pub struct Shared {
     accept_tx: Option<mpsc::Sender<Stream>>,
     pub(crate) shutdown_notify: Notify,
     pub(crate) stats: Stats,
-    pub(crate) peer_addr: Option<Address>,
+    // pub(crate) peer_addr: SocketAddr,
 }
 
 pub struct SendReady {
@@ -112,31 +103,32 @@ pub struct SendReady {
 }
 
 impl Session {
-    pub async fn client(
+    pub async fn client<C>(
         session_id: usize,
         epoch_id: u64,
         rand_id: u64,
         sm_config: &mut SessionManagerConfig,
-        addr: &Address,
-    ) -> Result<Self, Error> {
-        let mut mt = DefaultMakeTransport::new();
-        mt.set_connect_timeout(sm_config.config().connection_timeout);
-        mt.set_read_timeout(sm_config.config().connection_read_timeout);
-        mt.set_write_timeout(Some(sm_config.config().connection_write_timeout));
-        let conn_stream = mt.make_connection(addr.clone()).await?.stream;
+        connect: &C,
+        addr: C::Address,
+    ) -> Result<Self, Error>
+    where
+        C: TransportConnect,
+        <C::Stream as TransportStream>::ReadHalf: Send + 'static,
+        <C::Stream as TransportStream>::WriteHalf: Send + 'static,
+    {
+        let conn_stream = connect.connect(addr).await?;
 
         sm_config
             .config_mut()
             .share_memory_path_prefix
             .push_str(&format!("_{}", std::process::id()));
-        if let MemMapType::MemMapTypeDevShmFile = sm_config.config().mem_map_type {
-            if sm_config.config().share_memory_path_prefix.len()
+        if let MemMapType::MemMapTypeDevShmFile = sm_config.config().mem_map_type
+            && sm_config.config().share_memory_path_prefix.len()
                 + EPOCH_INFO_MAX_LEN
                 + QUEUE_INFO_MAX_LEN
                 > FILE_NAME_MAX_LEN
-            {
-                return Err(Error::FileNameTooLong);
-            }
+        {
+            return Err(Error::FileNameTooLong);
         }
         if epoch_id > 0 {
             sm_config
@@ -152,36 +144,39 @@ impl Session {
             );
         }
 
-        if let MemMapType::MemMapTypeMemFd = sm_config.config().mem_map_type {
-            if conn_stream.is_tcp() {
-                return Err(anyhow!(
-                    "conn_stream must be unix when config.mem_map_type is MemMapTypeMemFd"
-                ))?;
-            }
-        }
-
         Ok(Self::new(sm_config.config().clone(), conn_stream, None).await?)
     }
 
-    pub async fn server(
+    pub async fn server<S>(
         config: Config,
-        conn_stream: ConnStream,
+        conn_stream: S,
+        // addr: A,
         accept_tx: mpsc::Sender<Stream>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        S: TransportStream,
+        S::ReadHalf: Send + 'static,
+        S::WriteHalf: Send + 'static,
+    {
         Ok(Self::new(config, conn_stream, Some(accept_tx)).await?)
     }
 
-    async fn new(
+    async fn new<S>(
         mut config: Config,
-        conn_stream: ConnStream,
+        conn_stream: S,
+        // peer_addr: A,
         accept_tx: Option<mpsc::Sender<Stream>>,
-    ) -> Result<Session, anyhow::Error> {
+    ) -> Result<Self, anyhow::Error>
+    where
+        S: TransportStream,
+        S::ReadHalf: Send + 'static,
+        S::WriteHalf: Send + 'static,
+    {
         config
             .verify()
             .map_err(|err| err.context("verify config failed"))?;
 
         let conn_fd = conn_stream.as_raw_fd();
-        let peer_addr = conn_stream.peer_addr();
         let (owned_read_half, owned_write_half) = conn_stream.into_split();
         let is_client = accept_tx.is_none();
 
@@ -249,7 +244,7 @@ impl Session {
                 accept_tx,
                 shutdown_notify: Notify::new(),
                 stats: Stats::default(),
-                peer_addr,
+                // peer_addr,
             }),
         };
 
@@ -476,8 +471,12 @@ impl Session {
         }
     }
 
-    async fn read_loop(self, owned_read_half: OwnedReadHalf) {
-        let mut reader = BufReader::with_capacity(*BUF_READER_CAPACITY, owned_read_half);
+    async fn read_loop<R>(self, reader: R)
+    where
+        R: tokio::io::AsyncRead,
+    {
+        tokio::pin!(reader);
+        let mut reader = BufReader::with_capacity(*BUF_READER_CAPACITY, reader);
         let shutdown_notified = self.shared.shutdown_notify.notified();
         let mut len = HEADER_SIZE;
         tokio::pin!(shutdown_notified);
@@ -492,11 +491,9 @@ impl Session {
                             let (consumed, required, err) = self.handle_events(buf).await;
                             reader.consume(consumed);
                             len = required;
-                            if let Some(err) = err  {
-                                if !self.is_closed() {
-                                    self.exit_err(err).await;
-                                    return;
-                                }
+                            if let Some(err) = err && !self.is_closed() {
+                                self.exit_err(err).await;
+                                return;
                             }
                         }
                         Err(err) => {
@@ -512,44 +509,42 @@ impl Session {
         }
     }
 
-    async fn write_loop(
-        self,
-        mut owned_write_half: OwnedWriteHalf,
-        mut send_rx: mpsc::Receiver<SendReady>,
-    ) {
+    async fn write_loop<W>(self, writer: W, mut send_rx: mpsc::Receiver<SendReady>)
+    where
+        W: tokio::io::AsyncWrite,
+    {
+        tokio::pin!(writer);
         let shutdown_notified = self.shared.shutdown_notify.notified();
         tokio::pin!(shutdown_notified);
         loop {
-            tokio::select! {
-                ready = send_rx.recv() => {
-                    if let Some(ready) = ready {
-                        // send a header if ready
-                        if let Some(hdr) = ready.hdr {
-                            if let Err(err) = owned_write_half.write_all(hdr.as_slice()).await {
-                                drop(ready.tx);
-                                self.exit_err(err.into()).await;
-                                return;
-                            }
-                        }
-                        // send data from a body if given
-                        if !ready.body.is_empty() {
-                            if let Err(err) = owned_write_half.write_all(&ready.body).await {
-                                drop(ready.tx);
-                                self.exit_err(err.into()).await;
-                                return;
-                            }
-                        }
-
-                        // no error, successful send
-                        _ = ready.tx.send(());
-                    } else {
-                        return;
-                    }
-                }
-                _ = &mut shutdown_notified => {
-                    return;
-                }
+            let ready = match futures::future::select(
+                std::pin::pin!(send_rx.recv()),
+                &mut shutdown_notified,
+            )
+            .await
+            {
+                Either::Left((Some(ready), _)) => ready,
+                _ => return,
+            };
+            // send a header if ready
+            if let Some(hdr) = ready.hdr
+                && let Err(err) = writer.write_all(hdr.as_slice()).await
+            {
+                drop(ready.tx);
+                self.exit_err(err.into()).await;
+                return;
             }
+            // send data from a body if given
+            if !ready.body.is_empty()
+                && let Err(err) = writer.write_all(&ready.body).await
+            {
+                drop(ready.tx);
+                self.exit_err(err.into()).await;
+                return;
+            }
+
+            // no error, successful send
+            _ = ready.tx.send(());
         }
     }
 

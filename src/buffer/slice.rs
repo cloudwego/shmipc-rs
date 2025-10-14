@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::slice;
-use std::{cmp::min, ptr::NonNull};
+use std::{cmp::min, ptr::NonNull, slice};
 
 use crate::{
     buffer::manager::{
@@ -158,8 +157,7 @@ impl BufferSlice {
             is_from_shm,
             next_slice: None,
         };
-        if is_from_shm && header.is_some() {
-            let buffer_header = header.unwrap();
+        if is_from_shm && let Some(buffer_header) = header {
             s.cap = buffer_header.cap();
             s.start = buffer_header.start();
             s.write_index = (s.start + buffer_header.size()) as usize;
@@ -171,15 +169,18 @@ impl BufferSlice {
     }
 
     pub fn update(&self) {
-        if let Some(buffer_header) = &self.buffer_header {
-            buffer_header.set_size(self.size() as u32);
-            buffer_header.set_start(self.start);
+        let Some(buffer_header) = &self.buffer_header else {
+            return;
+        };
 
-            if let Some(next_slice) = &self.next_slice {
-                unsafe {
-                    buffer_header.link_next((*next_slice.as_ptr()).offset_in_shm);
-                }
-            }
+        buffer_header.set_size(self.size() as u32);
+        buffer_header.set_start(self.start);
+
+        let Some(next_slice) = &self.next_slice else {
+            return;
+        };
+        unsafe {
+            buffer_header.link_next((*next_slice.as_ptr()).offset_in_shm);
         }
     }
 
@@ -194,15 +195,15 @@ impl BufferSlice {
         self.next_slice = None;
     }
 
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         self.write_index - self.read_index
     }
 
-    pub fn remain(&self) -> usize {
+    pub const fn remain(&self) -> usize {
         self.cap as usize - self.write_index
     }
 
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.cap as usize
     }
 
@@ -254,13 +255,19 @@ impl BufferSlice {
     }
 
     #[inline]
-    pub fn next(&self) -> Option<&BufferSlice> {
-        unsafe { self.next_slice.map(|node| &(*node.as_ptr())) }
+    pub const fn next(&self) -> Option<&BufferSlice> {
+        let Some(next_slice) = self.next_slice else {
+            return None;
+        };
+        unsafe { Some(&*next_slice.as_ptr()) }
     }
 
     #[inline]
-    pub fn next_mut(&self) -> Option<&mut BufferSlice> {
-        unsafe { self.next_slice.map(|node| &mut (*node.as_ptr())) }
+    pub const fn next_mut(&self) -> Option<&mut BufferSlice> {
+        let Some(next_slice) = self.next_slice else {
+            return None;
+        };
+        unsafe { Some(&mut *next_slice.as_ptr()) }
     }
 }
 
@@ -344,7 +351,7 @@ impl BufferHeader {
 
 #[cfg(test)]
 mod tests {
-    use core::slice;
+    use std::slice;
 
     use memmap2::MmapOptions;
     use rand::Rng;
