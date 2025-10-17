@@ -31,89 +31,125 @@ pub struct SliceList {
 }
 
 impl SliceList {
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            front_slice: None,
+            write_slice: None,
+            back_slice: None,
+            len: 0,
+        }
     }
 
     #[inline]
-    pub fn front(&self) -> Option<&BufferSlice> {
-        unsafe { self.front_slice.map(|node| &(*node.as_ptr())) }
+    pub const fn front(&self) -> Option<&BufferSlice> {
+        match self.front_slice {
+            Some(front) => Some(unsafe { front.as_ref() }),
+            None => None,
+        }
     }
 
     #[inline]
-    pub fn front_mut(&self) -> Option<&mut BufferSlice> {
-        unsafe { self.front_slice.map(|node| &mut (*node.as_ptr())) }
+    #[allow(clippy::mut_from_ref)]
+    pub const fn front_mut(&self) -> Option<&mut BufferSlice> {
+        match self.front_slice {
+            Some(mut front) => Some(unsafe { front.as_mut() }),
+            None => None,
+        }
     }
 
     #[inline]
-    pub fn back(&self) -> Option<&BufferSlice> {
-        unsafe { self.back_slice.map(|node| &(*node.as_ptr())) }
+    pub const fn back(&self) -> Option<&BufferSlice> {
+        match self.back_slice {
+            Some(back) => Some(unsafe { back.as_ref() }),
+            None => None,
+        }
     }
 
     #[inline]
-    pub fn back_mut(&self) -> Option<&mut BufferSlice> {
-        unsafe { self.back_slice.map(|node| &mut (*node.as_ptr())) }
+    #[allow(clippy::mut_from_ref)]
+    pub const fn back_mut(&self) -> Option<&mut BufferSlice> {
+        match self.back_slice {
+            Some(mut back) => Some(unsafe { back.as_mut() }),
+            None => None,
+        }
     }
 
     #[inline]
-    pub fn write(&self) -> Option<&BufferSlice> {
-        unsafe { self.write_slice.map(|node| &(*node.as_ptr())) }
+    pub const fn write(&self) -> Option<&BufferSlice> {
+        match self.write_slice {
+            Some(write) => Some(unsafe { write.as_ref() }),
+            None => None,
+        }
     }
 
     #[inline]
-    pub fn write_mut(&self) -> Option<&mut BufferSlice> {
-        unsafe { self.write_slice.map(|node| &mut (*node.as_ptr())) }
+    #[allow(clippy::mut_from_ref)]
+    pub const fn write_mut(&self) -> Option<&mut BufferSlice> {
+        match self.write_slice {
+            Some(mut write) => Some(unsafe { write.as_mut() }),
+            None => None,
+        }
     }
 
     #[inline]
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         self.len
     }
 
     pub fn push_back(&mut self, s: BufferSlice) {
-        unsafe {
-            let new = NonNull::new_unchecked(Box::into_raw(Box::new(s)));
-            if self.len > 0 {
-                self.back_slice.unwrap().as_mut().next_slice = Some(new);
-            } else {
+        debug_assert!(s.next_slice.is_none());
+        let new = Box::into_raw(Box::new(s));
+        let new = unsafe { NonNull::new_unchecked(new) };
+        match self.back_slice {
+            Some(mut back) => {
+                debug_assert_ne!(self.len, 0);
+                unsafe { back.as_mut().next_slice = Some(new) };
+            }
+            None => {
+                debug_assert_eq!(self.len, 0);
                 self.front_slice = Some(new);
             }
-            self.back_slice = Some(new);
-            self.len += 1;
         }
+
+        self.back_slice = Some(new);
+        self.len += 1;
     }
 
     pub fn pop_front(&mut self) -> Option<BufferSlice> {
-        unsafe {
-            let r = self.front_slice;
-            if self.len > 0 {
-                self.len -= 1;
-                self.front_slice = self.front_slice.unwrap().as_ref().next_slice;
-            }
-            if self.len == 0 {
-                self.front_slice = None;
-                self.back_slice = None;
-            }
-            r.map(|node| *Box::from_raw(node.as_ptr()))
+        let Some(mut front) = self.front_slice else {
+            debug_assert_eq!(self.len, 0);
+            return None;
+        };
+        debug_assert_ne!(self.len, 0);
+        self.len -= 1;
+        let front_ref = unsafe { front.as_mut() };
+        self.front_slice = front_ref.next_slice;
+        front_ref.next_slice = None;
+
+        if self.len == 0 {
+            debug_assert!(self.front_slice.is_none());
+            self.back_slice = None;
         }
+
+        Some(*unsafe { Box::from_raw(front.as_ptr()) })
     }
 
     pub fn split_from_write(&mut self) -> Option<BufferSlice> {
-        unsafe {
-            self.write_slice.and_then(|slice| {
-                let next_list_head = (*slice.as_ptr()).next_slice;
-                self.back_slice = Some(slice);
-                (*slice.as_ptr()).next_slice = None;
-                let mut next_list_size = 0;
-                let mut s = next_list_head;
-                while s.is_some() {
-                    next_list_size += 1;
-                    s = (*s.unwrap_unchecked().as_ptr()).next_slice;
-                }
-                self.len -= next_list_size;
-                next_list_head.map(|head| *Box::from_raw(head.as_ptr()))
-            })
+        let mut write_slice_ptr = self.write_slice?;
+        let write_slice = unsafe { write_slice_ptr.as_mut() };
+
+        let next_list_head = write_slice.next_slice;
+        self.back_slice = Some(write_slice_ptr);
+        write_slice.next_slice = None;
+        let mut next_list_size = 0;
+        let mut s = next_list_head;
+        while let Some(next) = s {
+            next_list_size += 1;
+            unsafe { s = next.as_ref().next_slice };
         }
+
+        self.len -= next_list_size;
+        Some(*unsafe { Box::from_raw(next_list_head?.as_ptr()) })
     }
 }
 
@@ -256,18 +292,19 @@ impl BufferSlice {
 
     #[inline]
     pub const fn next(&self) -> Option<&BufferSlice> {
-        let Some(next_slice) = self.next_slice else {
-            return None;
-        };
-        unsafe { Some(&*next_slice.as_ptr()) }
+        match self.next_slice {
+            Some(next) => Some(unsafe { next.as_ref() }),
+            None => None,
+        }
     }
 
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     pub const fn next_mut(&self) -> Option<&mut BufferSlice> {
-        let Some(next_slice) = self.next_slice else {
-            return None;
-        };
-        unsafe { Some(&mut *next_slice.as_ptr()) }
+        match self.next_slice {
+            Some(mut next) => Some(unsafe { next.as_mut() }),
+            None => None,
+        }
     }
 }
 
