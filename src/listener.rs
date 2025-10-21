@@ -17,6 +17,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use futures::future::Either;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -68,14 +69,18 @@ impl Listener {
         <L::Stream as TransportStream>::ReadHalf: Send + 'static,
         <L::Stream as TransportStream>::WriteHalf: Send + 'static,
     {
+        let mut closed = std::pin::pin!(stream_tx.closed());
         loop {
-            let res = tokio::select! {
-                res = listener.accept() => res,
-                _ = stream_tx.closed() => {
+            let res = match futures::future::select(std::pin::pin!(listener.accept()), &mut closed)
+                .await
+            {
+                Either::Left((res, _)) => res,
+                Either::Right(_) => {
                     tracing::warn!("[ShmIPC] session receiver is closed, shutdown listener");
                     return;
                 }
             };
+
             match res {
                 Ok((stream, _)) => {
                     let (tx, rx) = mpsc::channel::<Stream>(config.max_stream_num);

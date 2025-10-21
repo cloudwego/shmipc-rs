@@ -54,7 +54,7 @@ unsafe impl Send for LinkedBuffer {}
 unsafe impl Sync for LinkedBuffer {}
 
 impl LinkedBuffer {
-    pub fn new(buffer_manager: Arc<BufferManager>) -> Self {
+    pub const fn new(buffer_manager: Arc<BufferManager>) -> Self {
         Self {
             slice_list: SliceList::new(),
             recycle_mux: Mutex::new(()),
@@ -194,32 +194,32 @@ impl LinkedBuffer {
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
-    pub fn len_mut(&mut self) -> &mut usize {
+    pub const fn len_mut(&mut self) -> &mut usize {
         &mut self.len
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
-    pub fn is_from_share_memory(&self) -> bool {
+    pub const fn is_from_share_memory(&self) -> bool {
         self.is_from_shm
     }
 
     #[inline]
-    pub fn slice_list(&self) -> &SliceList {
+    pub const fn slice_list(&self) -> &SliceList {
         &self.slice_list
     }
 
     #[inline]
-    pub fn slice_list_mut(&mut self) -> &mut SliceList {
+    pub const fn slice_list_mut(&mut self) -> &mut SliceList {
         &mut self.slice_list
     }
 

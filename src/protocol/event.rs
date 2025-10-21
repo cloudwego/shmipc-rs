@@ -133,7 +133,7 @@ impl FallbackDataEvent {
     }
 
     #[inline]
-    pub fn as_slice(&self) -> &[u8] {
+    pub const fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.0, HEADER_SIZE + 8) }
     }
 }

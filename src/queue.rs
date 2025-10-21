@@ -310,16 +310,16 @@ impl Queue {
     }
 
     #[allow(unused)]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         self.size() == self.cap
     }
 
     #[allow(unused)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.size() == 0
     }
 
-    pub fn size(&self) -> i64 {
+    pub const fn size(&self) -> i64 {
         unsafe { self.tail.read_unaligned() - self.head.read_unaligned() }
     }
 
@@ -347,7 +347,7 @@ impl Queue {
     }
 }
 
-fn count_queue_mem_size(queue_cap: u32) -> usize {
+const fn count_queue_mem_size(queue_cap: u32) -> usize {
     QUEUE_HEADER_LENGTH + QUEUE_ELEMENT_LEN * queue_cap as usize
 }
 

@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+use futures::future::Either;
 use tokio::sync::Notify;
 
 use crate::{
@@ -112,19 +113,21 @@ impl Stream {
         if recv_len >= min_size {
             return Ok(());
         }
-
         if recv_len == 0 && self.inner.state.load(Ordering::SeqCst) != STREAM_OPENED {
             return Err(Error::EndOfStream);
         }
+
+        let mut close = std::pin::pin!(self.inner.close_notify.notified());
         loop {
-            tokio::select! {
-                _ = self.inner.recv_notify.notified() => {
+            let mut recv = std::pin::pin!(self.inner.recv_notify.notified());
+            match futures::future::select(&mut recv, &mut close).await {
+                Either::Left(_) => {
                     self.move_pending_data(buf);
                     if buf.len() >= min_size {
                         return Ok(());
                     }
                 }
-                _ = self.inner.close_notify.notified() => {
+                Either::Right(_) => {
                     self.move_pending_data(buf);
                     if buf.len() >= min_size {
                         return Ok(());

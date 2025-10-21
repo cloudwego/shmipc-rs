@@ -18,6 +18,7 @@ use std::sync::{
 };
 
 use arc_swap::ArcSwap;
+use futures::future::Either;
 use tokio::sync::Notify;
 
 use super::{Session, config::SessionManagerConfig};
@@ -147,25 +148,37 @@ where
 
         loop {
             let session = self.inner.sessions[i].load();
-            tokio::select! {
-                _ = session.shared.shutdown_notify.notified() => {
-                    loop {
-                        tokio::time::sleep(self.inner.sm_config.config().rebuild_interval).await;
+            let notified = std::pin::pin!(session.shared.shutdown_notify.notified());
+            match futures::future::select(notified, &mut shutdown_rx).await {
+                Either::Left(_) => {}
+                Either::Right(_) => return,
+            }
 
-                        match Session::client(i, 0, 0, &mut self.inner.sm_config.clone(), &self.inner.connect, self.inner.addr.clone()).await {
-                            Ok(new_session) => {
-                                self.inner.sessions[i].store(Arc::new(new_session));
-                                tracing::info!("rebuild session {i} success");
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!("rebuild session {i} error: {:?}, retry after {:?}", e, self.inner.sm_config.config().rebuild_interval);
-                            }
-                        }
+            loop {
+                tokio::time::sleep(self.inner.sm_config.config().rebuild_interval).await;
+
+                match Session::client(
+                    i,
+                    0,
+                    0,
+                    &mut self.inner.sm_config.clone(),
+                    &self.inner.connect,
+                    self.inner.addr.clone(),
+                )
+                .await
+                {
+                    Ok(new_session) => {
+                        self.inner.sessions[i].store(Arc::new(new_session));
+                        tracing::info!("rebuild session {i} success");
+                        break;
                     }
-                }
-                _ = &mut shutdown_rx => {
-                    return;
+                    Err(e) => {
+                        tracing::error!(
+                            "rebuild session {i} error: {:?}, retry after {:?}",
+                            e,
+                            self.inner.sm_config.config().rebuild_interval
+                        );
+                    }
                 }
             }
         }

@@ -40,7 +40,7 @@ pub struct ClientProtocolAdapter {
 }
 
 impl ClientProtocolAdapter {
-    pub fn new(
+    pub const fn new(
         conn_fd: RawFd,
         mem_map_type: MemMapType,
         buffer_path: String,
@@ -127,7 +127,7 @@ pub struct ServerProtocolAdapter {
 }
 
 impl ServerProtocolAdapter {
-    pub fn new(conn_fd: RawFd) -> Self {
+    pub const fn new(conn_fd: RawFd) -> Self {
         Self { conn_fd }
     }
 

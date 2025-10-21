@@ -373,17 +373,23 @@ impl Session {
     pub async fn wait_for_send(&self, hdr: Option<Header>, body: Vec<u8>) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel::<()>();
         let ready = SendReady { hdr, body, tx };
-        tokio::select! {
-            _ = self.shared.send_tx.send(ready) => {
+        match tokio::time::timeout(
+            self.shared.config.connection_write_timeout,
+            self.shared.send_tx.send(ready),
+        )
+        .await
+        {
+            Ok(_) => {
                 if let Err(err) = rx.await {
                     return Err(anyhow!("wait for send failed, error={}", err).into());
                 }
             }
-            _ = tokio::time::sleep(self.shared.config.connection_write_timeout) => {
+            Err(_) => {
                 tracing::debug!("write timeout, send channel is full");
                 return Err(Error::ConnectionWriteTimeout);
             }
-        };
+        }
+
         Ok(())
     }
 
@@ -451,9 +457,10 @@ impl Session {
         mut rx: mpsc::Receiver<Stream>,
         stream_tx: mpsc::UnboundedSender<std::io::Result<Option<Stream>>>,
     ) {
+        let mut notified = std::pin::pin!(self.shared.shutdown_notify.notified());
         loop {
-            tokio::select! {
-                res = rx.recv() => {
+            match futures::future::select(std::pin::pin!(rx.recv()), &mut notified).await {
+                Either::Left((res, _)) => {
                     if let Some(stream) = res {
                         if stream_tx.send(Ok(Some(stream))).is_err() {
                             return;
@@ -463,7 +470,7 @@ impl Session {
                         continue;
                     }
                 }
-                _ = self.shared.shutdown_notify.notified() => {
+                Either::Right(_) => {
                     tracing::info!("session shutdown");
                     return;
                 }
@@ -477,32 +484,37 @@ impl Session {
     {
         tokio::pin!(reader);
         let mut reader = BufReader::with_capacity(*BUF_READER_CAPACITY, reader);
-        let shutdown_notified = self.shared.shutdown_notify.notified();
+        let mut shutdown_notified = std::pin::pin!(self.shared.shutdown_notify.notified());
         let mut len = HEADER_SIZE;
-        tokio::pin!(shutdown_notified);
         loop {
-            tokio::select! {
-                buf = reader.fill_buf_at_least(len) => {
+            let buf = match futures::future::select(
+                std::pin::pin!(reader.fill_buf_at_least(len)),
+                &mut shutdown_notified,
+            )
+            .await
+            {
+                Either::Left((buf, _)) => {
                     if self.shared.shutdown.load(Ordering::SeqCst) == 1 {
                         return;
                     }
-                    match buf {
-                        Ok(buf) => {
-                            let (consumed, required, err) = self.handle_events(buf).await;
-                            reader.consume(consumed);
-                            len = required;
-                            if let Some(err) = err && !self.is_closed() {
-                                self.exit_err(err).await;
-                                return;
-                            }
-                        }
-                        Err(err) => {
-                            self.exit_err(err.into()).await;
-                            return;
-                        }
+                    buf
+                }
+                Either::Right(_) => return,
+            };
+            match buf {
+                Ok(buf) => {
+                    let (consumed, required, err) = self.handle_events(buf).await;
+                    reader.consume(consumed);
+                    len = required;
+                    if let Some(err) = err
+                        && !self.is_closed()
+                    {
+                        self.exit_err(err).await;
+                        return;
                     }
                 }
-                _ = &mut shutdown_notified => {
+                Err(err) => {
+                    self.exit_err(err.into()).await;
                     return;
                 }
             }
@@ -738,10 +750,10 @@ impl Session {
                 .write()
                 .unwrap()
                 .insert(id, stream.clone());
-            tokio::select! {
-                _ = self.shared.accept_tx.as_ref().unwrap().send(stream.clone()) => {},
-                _ = self.shared.shutdown_notify.notified() => {},
-            }
+
+            let send = std::pin::pin!(self.shared.accept_tx.as_ref().unwrap().send(stream.clone()));
+            let notified = std::pin::pin!(self.shared.shutdown_notify.notified());
+            futures::future::select(send, notified).await;
             return Some(stream);
         }
         None
