@@ -112,6 +112,7 @@ impl TransportListen for DefaultUnixListen {
                 "unnamed unix domain socket cannot be listened",
             ));
         };
+        let _ = nix::unistd::unlink(path);
         UnixListener::bind(path)
     }
 }

@@ -18,10 +18,12 @@ use std::{
 };
 
 use shmipc::{
-    AsyncReadShm, AsyncWriteShm, BufferReader, BufferSlice, Error, LinkedBuffer, Listener,
-    SessionManager, SessionManagerConfig, Stream,
+    Error, Listener,
+    buffer::{BufferReader, BufferSlice, LinkedBuffer},
     config::SizePercentPair,
     consts::MemMapType,
+    session::{SessionManager, SessionManagerConfig},
+    stream::Stream,
     transport::{DefaultUnixConnect, DefaultUnixListen},
 };
 
@@ -62,7 +64,7 @@ async fn test_ping_pong_by_shmipc() {
 
     tokio_scoped::scope(|s| {
         s.spawn(async move {
-            let mut stream = server.accept().await.unwrap().unwrap();
+            let mut stream = server.accept().await.unwrap();
             must_read(&mut stream, size).await;
             stream.recv_buf().release_previous_read();
             must_write(&mut stream, size).await;

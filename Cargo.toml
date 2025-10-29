@@ -35,20 +35,13 @@ rand = "0.9"
 tokio-scoped = "0.2"
 tracing-subscriber = "0.3"
 
-
-[profile.dev]
-overflow-checks = false
-
 [profile.release]
 opt-level = 3
 debug = true
 rpath = false
 lto = true
-debug-assertions = false
 codegen-units = 1
 panic = 'unwind'
-incremental = false
-overflow-checks = false
 
 [workspace]
 members = ["examples"]

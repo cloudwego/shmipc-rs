@@ -27,7 +27,7 @@ pub struct SizePercentPair {
     pub percent: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 /// Config is used to tune the shmipc session
 pub struct Config {
     /// connection_write_timeout is meant to be a "safety value" timeout after
@@ -69,12 +69,6 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Config {
-    pub fn new() -> Self {
         Self {
             connection_write_timeout: Duration::from_secs(10),
             connection_read_timeout: None,
@@ -89,6 +83,12 @@ impl Config {
             rebuild_interval: SESSION_REBUILD_INTERVAL,
             max_stream_num: 4096,
         }
+    }
+}
+
+impl Config {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn verify(&self) -> Result<(), anyhow::Error> {

@@ -15,7 +15,10 @@
 use std::os::unix::net::SocketAddr;
 
 use nix::unistd::unlink;
-use shmipc::{Listener, config::Config, stream::Stream, transport::DefaultUnixListen};
+use shmipc::{
+    Listener, compact::StreamExt, config::Config, stream::Stream, transport::DefaultUnixListen,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() {
@@ -45,24 +48,29 @@ async fn main() {
     }
 }
 
-async fn handle_stream(mut stream: Stream) {
+async fn handle_stream(stream: Stream) {
+    const EXPECTED_REQ: &str = "client say hello world!!!";
+    let mut buf = vec![0; 4096];
+    let mut conn = StreamExt::new(stream);
+
     loop {
-        let req_msg = match stream.read_bytes("client say hello world!!!".len()).await {
-            Ok(msg) => msg,
+        match conn.read_exact(&mut buf[..EXPECTED_REQ.len()]).await {
+            Ok(len) => println!("read {len}"),
             Err(e) => {
                 eprintln!("failed to read msg, err: {e}");
                 break;
             }
-        };
+        }
+
         println!(
             "server receive request {}",
-            String::from_utf8(req_msg.to_vec()).unwrap()
+            str::from_utf8(&buf[..EXPECTED_REQ.len()]).unwrap()
         );
 
         let resp_msg = "server hello world!!!";
-        stream.write_bytes(resp_msg.as_bytes()).unwrap();
-        stream.flush(true).await.unwrap();
+        conn.write_all(resp_msg.as_bytes()).await.unwrap();
+        conn.flush().await.unwrap();
     }
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    stream.close().await.unwrap();
+    conn.shutdown().await.unwrap();
 }

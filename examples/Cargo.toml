@@ -17,5 +17,13 @@ name = "greeter_client"
 path = "src/hello_world/greeter_client.rs"
 
 [[bin]]
+name = "greeter_client_tokio"
+path = "src/hello_world/greeter_client_tokio.rs"
+
+[[bin]]
 name = "greeter_server"
 path = "src/hello_world/greeter_server.rs"
+
+[[bin]]
+name = "greeter_server_tokio"
+path = "src/hello_world/greeter_server_tokio.rs"

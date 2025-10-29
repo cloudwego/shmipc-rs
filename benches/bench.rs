@@ -16,10 +16,12 @@ use std::os::unix::net::SocketAddr;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use shmipc::{
-    AsyncReadShm, AsyncWriteShm, BufferReader, BufferSlice, Error, LinkedBuffer, Listener,
-    SessionManager, SessionManagerConfig, Stream,
+    Error, Listener,
+    buffer::{BufferReader, BufferSlice, LinkedBuffer},
     config::SizePercentPair,
     consts::MemMapType,
+    session::{SessionManager, SessionManagerConfig},
+    stream::Stream,
     transport::{DefaultUnixConnect, DefaultUnixListen},
 };
 use tokio::{
@@ -93,7 +95,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                         loop {
                             tokio::select! {
                                 r = server.accept() => {
-                                    let mut stream = r.unwrap().unwrap();
+                                    let mut stream = r.unwrap();
                                     tokio::spawn(async move {
                                         loop {
                                             if !must_read(&mut stream, size).await {

@@ -15,14 +15,14 @@
 use std::{
     io,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 
 use futures::future::Either;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     config::Config,
-    error::Error,
     session::Session,
     stream::Stream,
     transport::{TransportListen, TransportListener, TransportStream},
@@ -30,12 +30,13 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Listener {
-    stream_rx: mpsc::UnboundedReceiver<io::Result<Option<Stream>>>,
+    stream_rx: mpsc::UnboundedReceiver<io::Result<Stream>>,
     sessions: Arc<Mutex<Vec<Session>>>,
+    accept_handle: JoinHandle<()>,
 }
 
 impl Listener {
-    pub async fn new<L>(listen: L, addr: L::Address, config: Config) -> Result<Self, Error>
+    pub async fn new<L>(listen: L, addr: L::Address, config: Config) -> Result<Self, io::Error>
     where
         L: TransportListen,
         L::Listener: Send + 'static,
@@ -48,21 +49,43 @@ impl Listener {
         let (tx, rx) = mpsc::unbounded_channel();
         let sessions = Arc::new(Mutex::new(Vec::new()));
 
-        tokio::spawn(Self::accept_loop(listener, config, tx, sessions.clone()));
+        let handle = tokio::spawn(Self::accept_loop(listener, config, tx, sessions.clone()));
         Ok(Self {
             stream_rx: rx,
             sessions,
+            accept_handle: handle,
         })
     }
 
-    pub async fn accept(&mut self) -> io::Result<Option<Stream>> {
-        self.stream_rx.recv().await.unwrap_or(Ok(None))
+    pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Stream>> {
+        match self.stream_rx.poll_recv(cx) {
+            Poll::Ready(Some(res)) => Poll::Ready(res),
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "shmipc listener is aborted",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Accept a ShmIPC connection [`Stream`].
+    ///
+    /// NOTE: after using the [`Stream`], you MUST explicitly call `stream.close().await` for
+    /// releasing it, otherwise it will cause resource leak.
+    pub async fn accept(&mut self) -> io::Result<Stream> {
+        match self.stream_rx.recv().await {
+            Some(res) => res,
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "shmipc listener is aborted",
+            )),
+        }
     }
 
     async fn accept_loop<L>(
         listener: L,
         config: Config,
-        stream_tx: mpsc::UnboundedSender<io::Result<Option<Stream>>>,
+        stream_tx: mpsc::UnboundedSender<io::Result<Stream>>,
         sessions: Arc<Mutex<Vec<Session>>>,
     ) where
         L: TransportListener,
@@ -76,7 +99,7 @@ impl Listener {
             {
                 Either::Left((res, _)) => res,
                 Either::Right(_) => {
-                    tracing::warn!("[ShmIPC] session receiver is closed, shutdown listener");
+                    tracing::info!("[ShmIPC] session receiver is closed, shutdown listener");
                     return;
                 }
             };
@@ -109,5 +132,6 @@ impl Listener {
         for session in sessions {
             session.close().await;
         }
+        self.accept_handle.abort();
     }
 }

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io;
+
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// InvalidVersion means that we received a frame with an invalid version.
     #[error("invalid protocol version")]
@@ -145,4 +148,44 @@ pub enum Error {
 
     #[error(transparent)]
     Others(#[from] anyhow::Error),
+}
+
+impl From<Error> for io::Error {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::InvalidVersion => io::Error::new(io::ErrorKind::InvalidData, value),
+            Error::InvalidMsgType => io::Error::new(io::ErrorKind::InvalidData, value),
+            Error::SessionShutdown => io::Error::new(io::ErrorKind::ConnectionReset, value),
+            Error::StreamsExhausted => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::DuplicateStream => io::Error::new(io::ErrorKind::AlreadyExists, value),
+            Error::Timeout => io::Error::new(io::ErrorKind::TimedOut, value),
+            Error::StreamClosed => io::Error::new(io::ErrorKind::ConnectionAborted, value),
+            Error::StreamReset => io::Error::new(io::ErrorKind::ConnectionReset, value),
+            Error::ConnectionWriteTimeout => io::Error::new(io::ErrorKind::InvalidData, value),
+            Error::ConnectionTimeout => io::Error::new(io::ErrorKind::TimedOut, value),
+            Error::KeepAliveTimeout => io::Error::new(io::ErrorKind::TimedOut, value),
+            Error::EndOfStream => io::Error::new(io::ErrorKind::UnexpectedEof, value),
+            Error::SessionUnhealthy => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::NotEnoughData => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::NoMoreBuffer => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::SizeTooLarge => io::Error::new(io::ErrorKind::OutOfMemory, value),
+            Error::BrokenBuffer => io::Error::new(io::ErrorKind::BrokenPipe, value),
+            Error::ShareMemoryHadNotLeftSpace => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::StreamCallbackHadExisted => io::Error::new(io::ErrorKind::AlreadyExists, value),
+            Error::ExchangeConfig => io::Error::other(value),
+            Error::ExchangeConfigTimeout => io::Error::new(io::ErrorKind::TimedOut, value),
+            Error::OSNonSupported => io::Error::new(io::ErrorKind::Unsupported, value),
+            Error::ArchNonSupported => io::Error::new(io::ErrorKind::Unsupported, value),
+            Error::HotRestartInProgress => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::InHandshakeStage => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::FileNameTooLong => io::Error::new(io::ErrorKind::InvalidInput, value),
+            Error::QueueEmpty => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::QueueFull => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::StreamPoolFull => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::StreamHasUnreadData(_) => io::Error::other(value),
+            Error::StreamHasPendingData(_) => io::Error::other(value),
+            Error::Io(io) => io,
+            Error::Others(err) => io::Error::other(err),
+        }
+    }
 }

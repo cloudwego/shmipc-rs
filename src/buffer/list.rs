@@ -438,15 +438,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_create_free_buffer_list() {
-        assert!(
-            BufferList::create(
-                4294967295,
-                4294967295,
-                &MmapOptions::new().len(1).map_anon().unwrap(),
-                4294967279
-            )
-            .is_err()
+        BufferList::create(
+            4294967295,
+            4294967295,
+            &MmapOptions::new().len(1).map_anon().unwrap(),
+            4294967279,
         )
+        .unwrap_err();
     }
 }

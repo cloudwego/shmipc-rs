@@ -14,7 +14,6 @@
 
 use std::{
     cell::UnsafeCell,
-    future::Future,
     ptr::copy_nonoverlapping,
     sync::{
         Arc, Mutex,
@@ -23,11 +22,10 @@ use std::{
     time::Duration,
 };
 
-use futures::future::Either;
 use tokio::sync::Notify;
 
 use crate::{
-    buffer::{BufferReader, BufferWriter, buf::Buf, linked::LinkedBuffer, slice::BufferSlice},
+    buffer::{Buf, BufferReader, BufferWriter, linked::LinkedBuffer, slice::BufferSlice},
     consts::MAGIC_NUMBER,
     error::Error,
     protocol::event::{EventType, FallbackDataEvent},
@@ -64,7 +62,7 @@ unsafe impl Sync for StreamInner {}
 
 impl Stream {
     /// Construct a new stream within a given session for an ID
-    pub fn new(id: u32, session_id: usize, session: Session) -> Self {
+    pub(crate) fn new(id: u32, session_id: usize, session: Session) -> Self {
         let recv_notify = Notify::new();
         let close_notify = Notify::new();
         Self {
@@ -95,14 +93,12 @@ impl Stream {
         unsafe { &mut *self.inner.send_buf.get() }
     }
 
-    pub fn session(&self) -> &Session {
-        &self.session
-    }
-
-    pub fn stream_id(&self) -> u32 {
+    pub const fn stream_id(&self) -> u32 {
         self.id
     }
+}
 
+impl Stream {
     /// return underlying read buffer, whose'size >= minSize.
     ///
     /// if current's size is not enough, which will block until
@@ -113,21 +109,28 @@ impl Stream {
         if recv_len >= min_size {
             return Ok(());
         }
+
         if recv_len == 0 && self.inner.state.load(Ordering::SeqCst) != STREAM_OPENED {
             return Err(Error::EndOfStream);
         }
 
-        let mut close = std::pin::pin!(self.inner.close_notify.notified());
         loop {
-            let mut recv = std::pin::pin!(self.inner.recv_notify.notified());
-            match futures::future::select(&mut recv, &mut close).await {
-                Either::Left(_) => {
+            let recv_notified = self.inner.recv_notify.notified();
+            let close_notified = self.inner.close_notify.notified();
+
+            match futures::future::select(
+                std::pin::pin!(recv_notified),
+                std::pin::pin!(close_notified),
+            )
+            .await
+            {
+                futures::future::Either::Left(_) => {
                     self.move_pending_data(buf);
                     if buf.len() >= min_size {
                         return Ok(());
                     }
                 }
-                Either::Right(_) => {
+                futures::future::Either::Right(_) => {
                     self.move_pending_data(buf);
                     if buf.len() >= min_size {
                         return Ok(());
@@ -292,7 +295,7 @@ impl Stream {
         }
 
         let pending_data_len = self.inner.pending_data.lock().unwrap().len();
-        if !pending_data_len > 0 {
+        if pending_data_len > 0 {
             return Err(Error::StreamHasPendingData(pending_data_len));
         }
 
@@ -349,7 +352,7 @@ impl Stream {
         }
     }
 
-    pub fn session_id(&self) -> usize {
+    pub const fn session_id(&self) -> usize {
         self.session_id
     }
 
@@ -362,19 +365,9 @@ impl Stream {
     }
 
     pub async fn close(&mut self) -> Result<(), Error> {
-        let old_state = self.inner.state.load(Ordering::Acquire);
+        let old_state = self.inner.state.swap(STREAM_CLOSED, Ordering::Release);
         if old_state == STREAM_CLOSED {
             return Ok(());
-        }
-
-        if self
-            .inner
-            .state
-            .compare_exchange(old_state, STREAM_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            // something wrong
-            return Err(anyhow::anyhow!("stream state changed").into());
         }
         self.clean();
         if old_state != STREAM_OPENED {
@@ -417,35 +410,31 @@ impl Stream {
         }
         self.session.wait_for_send(None, event).await
     }
-}
 
-pub trait AsyncReadShm {
-    fn read_bytes(&mut self, size: usize) -> impl Future<Output = Result<Buf<'_>, Error>> + Send;
-    fn peek(&mut self, size: usize) -> impl Future<Output = Result<Buf<'_>, Error>> + Send;
-    fn discard(&mut self, size: usize) -> impl Future<Output = Result<usize, Error>> + Send;
-    fn release_previous_read(&self);
-}
-
-impl<T: AsyncReadShm + Send> AsyncReadShm for &mut T {
-    async fn read_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
-        (**self).read_bytes(size).await
+    /// Read a shm buffer.
+    ///
+    /// The length of this buffer depends on how much the peer writes at once.
+    ///
+    /// To specify a length of buffer, refer to [`Stream::read_bytes`].
+    ///
+    /// NOTE: after using the buffer, you MUST explicitly call `stream.release_read_and_reuse()`
+    /// for releasing it, otherwise it will cause memory leak.
+    pub async fn read(&mut self) -> Result<Buf<'_>, Error> {
+        let buf = self.recv_buf();
+        if buf.is_empty() {
+            tracing::debug!("read_bytes seqID:{}", self.id);
+            self.read_more(1, buf).await?;
+        }
+        buf.read_bytes(buf.len())
     }
 
-    async fn peek(&mut self, size: usize) -> Result<Buf<'_>, Error> {
-        (**self).peek(size).await
-    }
-
-    async fn discard(&mut self, size: usize) -> Result<usize, Error> {
-        (**self).discard(size).await
-    }
-
-    fn release_previous_read(&self) {
-        (**self).release_previous_read();
-    }
-}
-
-impl AsyncReadShm for Stream {
-    async fn read_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
+    /// Read a buffer of at least the given size.
+    ///
+    /// This function will return when enough data has been read. In other words, if there is not
+    /// enough data to fill the length, this function will block forever.
+    ///
+    /// To return immediately after getting a buffer, refer to [`Stream::read`].
+    pub async fn read_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
         let buf = self.recv_buf();
         if buf.len() < size {
             tracing::debug!(
@@ -459,7 +448,7 @@ impl AsyncReadShm for Stream {
         buf.read_bytes(size)
     }
 
-    async fn peek(&mut self, size: usize) -> Result<Buf<'_>, Error> {
+    pub async fn peek(&mut self, size: usize) -> Result<Buf<'_>, Error> {
         let buf = self.recv_buf();
         if buf.len() < size {
             self.read_more(size, buf).await?;
@@ -467,7 +456,7 @@ impl AsyncReadShm for Stream {
         buf.peek(size)
     }
 
-    async fn discard(&mut self, size: usize) -> Result<usize, Error> {
+    pub async fn discard(&mut self, size: usize) -> Result<usize, Error> {
         let buf = self.recv_buf();
         if buf.len() < size {
             self.read_more(size, buf).await?;
@@ -475,48 +464,15 @@ impl AsyncReadShm for Stream {
         buf.discard(size)
     }
 
-    fn release_previous_read(&self) {
-        self.recv_buf().release_previous_read();
-    }
-}
-
-pub trait AsyncWriteShm {
-    fn reserve(&mut self, size: usize) -> Result<&mut [u8], Error>;
-    fn write_bytes(&mut self, data: &[u8]) -> Result<usize, Error>;
-    fn flush(&mut self, end_stream: bool) -> impl Future<Output = Result<(), Error>> + Send;
-    /// close the stream. after close stream, any operation will return ErrStreamClosed.
-    /// unread data will be drained and released.
-    fn close(&mut self) -> impl Future<Output = Result<(), Error>> + Send;
-}
-
-impl<T: AsyncWriteShm> AsyncWriteShm for &mut T {
-    fn reserve(&mut self, size: usize) -> Result<&mut [u8], Error> {
-        (**self).reserve(size)
-    }
-
-    fn write_bytes(&mut self, data: &[u8]) -> Result<usize, Error> {
-        (**self).write_bytes(data)
-    }
-
-    fn flush(&mut self, end_stream: bool) -> impl Future<Output = Result<(), Error>> + Send {
-        (**self).flush(end_stream)
-    }
-
-    fn close(&mut self) -> impl Future<Output = Result<(), Error>> + Send {
-        (**self).close()
-    }
-}
-
-impl AsyncWriteShm for Stream {
-    fn reserve(&mut self, size: usize) -> Result<&mut [u8], Error> {
+    pub fn reserve(&mut self, size: usize) -> Result<&mut [u8], Error> {
         self.send_buf().reserve(size)
     }
 
-    fn write_bytes(&mut self, data: &[u8]) -> Result<usize, Error> {
+    pub fn write_bytes(&mut self, data: &[u8]) -> Result<usize, Error> {
         self.send_buf().write_bytes(data)
     }
 
-    async fn flush(&mut self, end_stream: bool) -> Result<(), Error> {
+    pub async fn flush(&mut self, end_stream: bool) -> Result<(), Error> {
         let send_buf = self.send_buf();
         if send_buf.is_empty() {
             return Ok(());
@@ -606,10 +562,6 @@ impl AsyncWriteShm for Stream {
             }
         }
         Ok(())
-    }
-
-    async fn close(&mut self) -> Result<(), Error> {
-        self.close().await
     }
 }
 
