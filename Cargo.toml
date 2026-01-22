@@ -29,7 +29,7 @@ pin-project = "1"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 futures = "0.3"
 rand = "0.9"
 tokio-scoped = "0.2"
