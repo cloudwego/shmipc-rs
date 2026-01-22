@@ -28,11 +28,11 @@ impl SessionManagerConfig {
         Self::default()
     }
 
-    pub fn config(&self) -> &Config {
+    pub const fn config(&self) -> &Config {
         &self.config
     }
 
-    pub fn config_mut(&mut self) -> &mut Config {
+    pub const fn config_mut(&mut self) -> &mut Config {
         &mut self.config
     }
 
@@ -41,7 +41,7 @@ impl SessionManagerConfig {
         self
     }
 
-    pub fn session_num(&self) -> usize {
+    pub const fn session_num(&self) -> usize {
         self.session_num
     }
 
@@ -50,7 +50,7 @@ impl SessionManagerConfig {
         self
     }
 
-    pub fn stream_max_idle_time(&self) -> Duration {
+    pub const fn stream_max_idle_time(&self) -> Duration {
         self.stream_max_idle_time
     }
 

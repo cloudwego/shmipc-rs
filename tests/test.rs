@@ -19,7 +19,10 @@ use std::{
 
 use shmipc::{
     AsyncReadShm, AsyncWriteShm, BufferReader, BufferSlice, Error, LinkedBuffer, Listener,
-    SessionManager, SessionManagerConfig, Stream, config::SizePercentPair, consts::MemMapType,
+    SessionManager, SessionManagerConfig, Stream,
+    config::SizePercentPair,
+    consts::MemMapType,
+    transport::{DefaultUnixConnect, DefaultUnixListen},
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -49,6 +52,7 @@ async fn test_ping_pong_by_shmipc() {
         .push_str(rand.to_string().as_str());
     sm_config = sm_config.with_session_num(1);
     let mut server = Listener::new(
+        DefaultUnixListen,
         SocketAddr::from_pathname(path.clone()).unwrap(),
         sm_config.config().clone(),
     )
@@ -64,9 +68,13 @@ async fn test_ping_pong_by_shmipc() {
             must_write(&mut stream, size).await;
         });
         s.spawn(async move {
-            let client = SessionManager::new(sm_config, SocketAddr::from_pathname(path).unwrap())
-                .await
-                .unwrap();
+            let client = SessionManager::new(
+                sm_config,
+                DefaultUnixConnect,
+                SocketAddr::from_pathname(path).unwrap(),
+            )
+            .await
+            .unwrap();
             let mut stream = client.get_stream().unwrap();
             must_write(&mut stream, size).await;
             must_read(&mut stream, size).await;

@@ -44,7 +44,7 @@ impl ProtocolInitializer {
         }
     }
 
-    pub fn version(&self) -> u8 {
+    pub const fn version(&self) -> u8 {
         match self {
             ProtocolInitializer::V2(_) => ProtocolInitializerV2::version(),
             ProtocolInitializer::V3(_) => ProtocolInitializerV3::version(),

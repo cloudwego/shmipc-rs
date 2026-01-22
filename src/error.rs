@@ -134,6 +134,12 @@ pub enum Error {
     #[error("stream pool is full")]
     StreamPoolFull,
 
+    #[error("stream had unread data, size: {0}")]
+    StreamHasUnreadData(usize),
+
+    #[error("stream had pending data, pending slice len: {0}")]
+    StreamHasPendingData(usize),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

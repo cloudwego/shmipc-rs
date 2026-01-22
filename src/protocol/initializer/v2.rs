@@ -36,7 +36,7 @@ impl ProtocolInitializerV2 {
         }
     }
 
-    pub fn version() -> u8 {
+    pub const fn version() -> u8 {
         2
     }
 }

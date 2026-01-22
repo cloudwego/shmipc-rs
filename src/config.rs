@@ -16,9 +16,9 @@ use std::{fmt::Debug, time::Duration};
 
 use anyhow::anyhow;
 
-use crate::{
-    buffer::manager::BUFFER_HEADER_SIZE,
-    consts::{DEFAULT_QUEUE_CAP, DEFAULT_SHARE_MEMORY_CAP, MemMapType, SESSION_REBUILD_INTERVAL},
+use crate::consts::{
+    DEFAULT_BUFFER_SLICE_SIZES, DEFAULT_QUEUE_CAP, DEFAULT_QUEUE_PATH, DEFAULT_SHARE_MEMORY_CAP,
+    MemMapType, SESSION_REBUILD_INTERVAL,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -81,24 +81,11 @@ impl Config {
             connection_timeout: None,
             initialize_timeout: Duration::from_millis(1000),
             queue_cap: DEFAULT_QUEUE_CAP,
-            queue_path: "/dev/shm/shmipc_queue".to_owned(),
+            queue_path: DEFAULT_QUEUE_PATH.to_owned(),
             share_memory_buffer_cap: DEFAULT_SHARE_MEMORY_CAP,
             share_memory_path_prefix: "/dev/shm/shmipc".to_owned(),
-            buffer_slice_sizes: vec![
-                SizePercentPair {
-                    size: 8192 - BUFFER_HEADER_SIZE,
-                    percent: 50,
-                },
-                SizePercentPair {
-                    size: 32 * 1024 - BUFFER_HEADER_SIZE,
-                    percent: 30,
-                },
-                SizePercentPair {
-                    size: 128 * 1024 - BUFFER_HEADER_SIZE,
-                    percent: 20,
-                },
-            ],
-            mem_map_type: MemMapType::MemMapTypeMemFd,
+            buffer_slice_sizes: DEFAULT_BUFFER_SLICE_SIZES.to_vec(),
+            mem_map_type: Default::default(),
             rebuild_interval: SESSION_REBUILD_INTERVAL,
             max_stream_num: 4096,
         }

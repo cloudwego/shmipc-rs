@@ -23,9 +23,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
+use futures::future::Either;
 use tokio::sync::Notify;
-use volo::net::Address;
 
 use crate::{
     buffer::{BufferReader, BufferWriter, buf::Buf, linked::LinkedBuffer, slice::BufferSlice},
@@ -114,19 +113,21 @@ impl Stream {
         if recv_len >= min_size {
             return Ok(());
         }
-
         if recv_len == 0 && self.inner.state.load(Ordering::SeqCst) != STREAM_OPENED {
             return Err(Error::EndOfStream);
         }
+
+        let mut close = std::pin::pin!(self.inner.close_notify.notified());
         loop {
-            tokio::select! {
-                _ = self.inner.recv_notify.notified() => {
+            let mut recv = std::pin::pin!(self.inner.recv_notify.notified());
+            match futures::future::select(&mut recv, &mut close).await {
+                Either::Left(_) => {
                     self.move_pending_data(buf);
                     if buf.len() >= min_size {
                         return Ok(());
                     }
                 }
-                _ = self.inner.close_notify.notified() => {
+                Either::Right(_) => {
                     self.move_pending_data(buf);
                     if buf.len() >= min_size {
                         return Ok(());
@@ -156,27 +157,26 @@ impl Stream {
             }
             let mut offset = data.offset;
             loop {
-                match self.session.shared.buffer_manager.read_buffer_slice(offset) {
-                    Ok(slice) => {
-                        if !slice
-                            .buffer_header
-                            .as_ref()
-                            .map(|h| h.has_next())
-                            .unwrap_or(false)
-                        {
-                            buf.append_buffer_slice(slice);
-                            break;
-                        }
-                        offset = slice.buffer_header.as_ref().unwrap().next_buffer_offset();
-                        buf.append_buffer_slice(slice);
-                    }
+                let slice = match self.session.shared.buffer_manager.read_buffer_slice(offset) {
+                    Ok(slice) => slice,
                     Err(err) => {
                         // it means that something bug about protocol occurred, underlying
                         // connection will be closed.
-                        tracing::error!("read_buffer_slice error {}", err);
+                        tracing::error!("read_buffer_slice error {err}");
                         break;
                     }
+                };
+                if !slice
+                    .buffer_header
+                    .as_ref()
+                    .map(|h| h.has_next())
+                    .unwrap_or(false)
+                {
+                    buf.append_buffer_slice(slice);
+                    break;
                 }
+                offset = slice.buffer_header.as_ref().unwrap().next_buffer_offset();
+                buf.append_buffer_slice(slice);
             }
         }
         self.session
@@ -288,18 +288,12 @@ impl Stream {
         // return error if has any unread data
         let unread_size = self.recv_buf().len();
         if unread_size > 0 {
-            return Err(anyhow!("stream had unread data, size:{} ", unread_size).into());
+            return Err(Error::StreamHasUnreadData(unread_size));
         }
 
-        {
-            let pending_data = self.inner.pending_data.lock().unwrap();
-            if !pending_data.is_empty() {
-                return Err(anyhow!(
-                    "stream had unread pending data, unread slice len:{} ",
-                    pending_data.len()
-                )
-                .into());
-            }
+        let pending_data_len = self.inner.pending_data.lock().unwrap().len();
+        if !pending_data_len > 0 {
+            return Err(Error::StreamHasPendingData(pending_data_len));
         }
 
         self.inner.in_fallback_state.store(false, Ordering::SeqCst);
@@ -368,7 +362,7 @@ impl Stream {
     }
 
     pub async fn close(&mut self) -> Result<(), Error> {
-        let old_state = self.inner.state.load(Ordering::SeqCst);
+        let old_state = self.inner.state.load(Ordering::Acquire);
         if old_state == STREAM_CLOSED {
             return Ok(());
         }
@@ -377,57 +371,51 @@ impl Stream {
             .inner
             .state
             .compare_exchange(old_state, STREAM_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            // something wrong
+            return Err(anyhow::anyhow!("stream state changed").into());
+        }
+        self.clean();
+        if old_state != STREAM_OPENED {
+            return Ok(());
+        }
+        self.safe_close_notify();
+
+        if self.session.shared.shutdown.load(Ordering::SeqCst) == 1 {
+            return Ok(());
+        }
+        // notify peer
+        if self
+            .session
+            .shared
+            .queue_manager
+            .send_queue
+            .put(QueueElement {
+                seq_id: self.id,
+                offset_in_shm_buf: 0,
+                status: STREAM_CLOSED,
+            })
             .is_ok()
         {
-            self.clean();
-            if old_state == STREAM_OPENED {
-                self.safe_close_notify();
-
-                if self.session.shared.shutdown.load(Ordering::SeqCst) == 1 {
-                    return Ok(());
-                }
-                // notify peer
-                match self
-                    .session
-                    .shared
-                    .queue_manager
-                    .send_queue
-                    .put(QueueElement {
-                        seq_id: self.id,
-                        offset_in_shm_buf: 0,
-                        status: STREAM_CLOSED,
-                    }) {
-                    Ok(_) => return self.session.wake_up_peer().await,
-                    Err(_) => {
-                        self.session
-                            .shared
-                            .stats
-                            .queue_full_error_count
-                            .fetch_add(1, Ordering::SeqCst);
-                        // notify close
-                        let mut event = vec![0u8; 12];
-                        unsafe {
-                            let ptr = event.as_mut_ptr();
-                            copy_nonoverlapping(12_u32.to_be_bytes().as_ptr(), ptr, 4);
-                            copy_nonoverlapping(
-                                MAGIC_NUMBER.to_be_bytes().as_ptr(),
-                                ptr.offset(4),
-                                2,
-                            );
-                            *ptr.offset(6) = self.session.shared.communication_version;
-                            *ptr.offset(7) = EventType::TYPE_STREAM_CLOSE.inner();
-                            copy_nonoverlapping(self.id.to_be_bytes().as_ptr(), ptr.offset(8), 4);
-                        }
-                        return self.session.wait_for_send(None, event).await;
-                    }
-                }
-            }
+            return self.session.wake_up_peer().await;
         }
-        Ok(())
-    }
-
-    pub fn peer_addr(&self) -> Option<Address> {
-        self.session.shared.peer_addr.clone()
+        self.session
+            .shared
+            .stats
+            .queue_full_error_count
+            .fetch_add(1, Ordering::SeqCst);
+        // notify close
+        let mut event = vec![0u8; 12];
+        unsafe {
+            let ptr = event.as_mut_ptr();
+            copy_nonoverlapping(12_u32.to_be_bytes().as_ptr(), ptr, 4);
+            copy_nonoverlapping(MAGIC_NUMBER.to_be_bytes().as_ptr(), ptr.offset(4), 2);
+            *ptr.offset(6) = self.session.shared.communication_version;
+            *ptr.offset(7) = EventType::TYPE_STREAM_CLOSE.inner();
+            copy_nonoverlapping(self.id.to_be_bytes().as_ptr(), ptr.offset(8), 4);
+        }
+        self.session.wait_for_send(None, event).await
     }
 }
 
@@ -572,49 +560,50 @@ impl AsyncWriteShm for Stream {
                 send_buf.clean();
                 return ret;
             }
-            Err(err) => match err {
-                Error::QueueFull => {
-                    self.session
-                        .shared
-                        .stats
-                        .queue_full_error_count
-                        .fetch_add(1, Ordering::SeqCst);
-                    for _ in 0..10 {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                                match self.session.shared.queue_manager.send_queue.put(QueueElement {
-                                    seq_id: self.id,
-                                    offset_in_shm_buf: send_buf.root_buf_offset(),
-                                    status: state,
-                                }) {
-                                    Ok(_) => {
-                                        let ret = self.session.wake_up_peer().await;
-                                        send_buf.clean();
-                                        return ret;
-                                    },
-                                    Err(err) => {
-                                        match err {
-                                            Error::QueueFull => continue,
-                                            _ => {
-                                                send_buf.recycle();
-                                                return Err(err);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ = self.inner.close_notify.notified() => {
-                                send_buf.recycle();
-                                return Err(Error::StreamClosed);
-                            }
-                        }
-                    }
+            Err(Error::QueueFull) => {}
+            Err(err) => {
+                send_buf.recycle();
+                return Err(err);
+            }
+        }
+        self.session
+            .shared
+            .stats
+            .queue_full_error_count
+            .fetch_add(1, Ordering::SeqCst);
+        for _ in 0..10 {
+            if tokio::time::timeout(
+                Duration::from_millis(10),
+                self.inner.close_notify.notified(),
+            )
+            .await
+            .is_ok()
+            {
+                send_buf.recycle();
+                return Err(Error::StreamClosed);
+            }
+
+            match self
+                .session
+                .shared
+                .queue_manager
+                .send_queue
+                .put(QueueElement {
+                    seq_id: self.id,
+                    offset_in_shm_buf: send_buf.root_buf_offset(),
+                    status: state,
+                }) {
+                Ok(_) => {
+                    let ret = self.session.wake_up_peer().await;
+                    send_buf.clean();
+                    return ret;
                 }
-                e => {
+                Err(Error::QueueFull) => continue,
+                Err(err) => {
                     send_buf.recycle();
-                    return Err(e);
+                    return Err(err);
                 }
-            },
+            }
         }
         Ok(())
     }

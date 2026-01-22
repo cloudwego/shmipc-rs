@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 
+use crate::{buffer::manager::BUFFER_HEADER_SIZE, config::SizePercentPair};
+
 pub const PROTO_VERSION: u8 = 2;
 pub const MAX_SUPPORT_PROTO_VERSION: u8 = 3;
 pub const MAGIC_NUMBER: u16 = 0x7758;
@@ -21,8 +23,8 @@ pub const MAGIC_NUMBER: u16 = 0x7758;
 #[repr(u8)]
 #[derive(Default, Clone, Copy, Debug)]
 pub enum MemMapType {
-    #[default]
     MemMapTypeDevShmFile = 0,
+    #[default]
     MemMapTypeMemFd,
 }
 
@@ -60,8 +62,23 @@ pub const EPOCH_INFO_MAX_LEN: usize = 7 + 20 + 1 + 20;
 pub const QUEUE_INFO_MAX_LEN: usize = 7 + 20;
 
 pub const DEFAULT_QUEUE_CAP: u32 = 8192;
+pub const DEFAULT_QUEUE_PATH: &str = "/dev/shm/shmipc_queue";
 pub const DEFAULT_SHARE_MEMORY_CAP: u32 = 32 * 1024 * 1024;
 pub const DEFAULT_SINGLE_BUFFER_SIZE: i64 = 4096;
+pub const DEFAULT_BUFFER_SLICE_SIZES: [SizePercentPair; 3] = [
+    SizePercentPair {
+        size: 8192 - BUFFER_HEADER_SIZE,
+        percent: 50,
+    },
+    SizePercentPair {
+        size: 32 * 1024 - BUFFER_HEADER_SIZE,
+        percent: 30,
+    },
+    SizePercentPair {
+        size: 128 * 1024 - BUFFER_HEADER_SIZE,
+        percent: 20,
+    },
+];
 pub const QUEUE_ELEMENT_LEN: usize = 12;
 pub const QUEUE_COUNT: usize = 2;
 

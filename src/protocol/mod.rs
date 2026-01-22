@@ -140,13 +140,12 @@ pub async fn init_client_protocol(
         initializer.init()?;
         Ok::<_, anyhow::Error>(initializer.version())
     });
-    tokio::select! {
-        res = handler => {
-            res?
-        }
-        _ = tokio::time::sleep(timeout) => {
-            Err(anyhow!("ProtocolInitializer init client timeout:{:?} ms", timeout))
-        }
+    match tokio::time::timeout(timeout, std::pin::pin!(handler)).await {
+        Ok(res) => res?,
+        Err(_) => Err(anyhow!(
+            "ProtocolInitializer init client timeout:{:?} ms",
+            timeout
+        )),
     }
 }
 
@@ -161,12 +160,11 @@ pub async fn init_server_protocol(
         let (bm, qm) = initializer.init()?.unwrap();
         Ok((bm, qm, initializer.version()))
     });
-    tokio::select! {
-        res = handler => {
-            res?
-        }
-        _ = tokio::time::sleep(timeout) => {
-            Err(anyhow!("ProtocolInitializer init server timeout:{:?} ms", timeout))
-        }
+    match tokio::time::timeout(timeout, std::pin::pin!(handler)).await {
+        Ok(res) => res?,
+        Err(_) => Err(anyhow!(
+            "ProtocolInitializer init server timeout:{:?} ms",
+            timeout
+        )),
     }
 }

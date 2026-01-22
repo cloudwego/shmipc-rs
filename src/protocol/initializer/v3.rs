@@ -41,7 +41,7 @@ impl ProtocolInitializerV3 {
         }
     }
 
-    pub fn version() -> u8 {
+    pub const fn version() -> u8 {
         3
     }
 }

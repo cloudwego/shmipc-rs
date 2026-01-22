@@ -15,7 +15,7 @@
 use std::os::unix::net::SocketAddr;
 
 use nix::unistd::unlink;
-use shmipc::{AsyncReadShm, AsyncWriteShm, Listener, config::Config};
+use shmipc::{AsyncReadShm, AsyncWriteShm, Listener, config::Config, transport::DefaultUnixListen};
 
 #[tokio::main]
 async fn main() {
@@ -26,6 +26,7 @@ async fn main() {
     _ = unlink(uds_path);
 
     let mut ln = Listener::new(
+        DefaultUnixListen,
         SocketAddr::from_pathname(binding).unwrap(),
         Config::default(),
     )

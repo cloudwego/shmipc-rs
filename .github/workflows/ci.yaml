@@ -37,7 +37,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Format check
         run: |
-          cargo fmt -- --check
+          cargo +nightly fmt --all -- --check
 
   docs-check:
     runs-on: [self-hosted, Linux, amd64]
@@ -53,7 +53,7 @@ jobs:
           toolchain: ${{matrix.rust}}
       - name: Docs check
         run: |
-          cargo rustdoc --all-features -- --deny warnings
+          cargo rustdoc --all-features --config 'build.rustdocflags=["--cfg", "docsrs"]' -- --deny warnings
 
   test-linux:
     runs-on: [self-hosted, Linux, amd64]
