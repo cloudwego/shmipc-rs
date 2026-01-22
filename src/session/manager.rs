@@ -112,10 +112,10 @@ where
         Ok(sm)
     }
 
-    /// Return a shmipc's stream from stream pool.
+    /// Get a ShmIPC's [`Stream`] from pool.
     ///
-    /// Every stream should explicitly call `put_back()` to return it to SessionManager for next
-    /// time using, otherwise it will cause resource leak.
+    /// NOTE: after using the [`Stream`], you MUST explicitly call `stream.reuse().await` for
+    /// releasing it, otherwise it will cause resource leak.
     pub fn get_stream(&self) -> Result<Stream, Error> {
         let sessions = &self.inner.sessions;
         if sessions.is_empty() {

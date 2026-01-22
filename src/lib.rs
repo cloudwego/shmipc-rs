@@ -14,24 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod buffer;
 mod error;
 mod listener;
 mod protocol;
 mod queue;
-mod session;
-mod stream;
 mod util;
 
+pub mod buffer;
+pub mod compact;
 pub mod config;
 pub mod consts;
+pub mod session;
 pub mod stats;
+pub mod stream;
 pub mod transport;
 
-pub use self::{
-    buffer::{BufferReader, BufferWriter, linked::LinkedBuffer, slice::BufferSlice},
-    error::Error,
-    listener::Listener,
-    session::{config::SessionManagerConfig, manager::SessionManager},
-    stream::{AsyncReadShm, AsyncWriteShm, Stream},
-};
+pub use self::{error::Error, listener::Listener};

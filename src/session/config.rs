@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionManagerConfig {
     config: Config,
     session_num: usize,

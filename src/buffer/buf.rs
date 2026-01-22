@@ -23,6 +23,20 @@ pub enum Buf<'shm> {
 }
 
 impl Buf<'_> {
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Shm(s) => s.len(),
+            Self::Exm(b) => b.len(),
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        match self {
+            Self::Shm(s) => s.is_empty(),
+            Self::Exm(b) => b.is_empty(),
+        }
+    }
+
     /// # Safety
     ///
     /// The caller must ensure that the shm buf is valid before the return value is out of usage.
@@ -215,5 +229,23 @@ impl PartialEq<Buf<'_>> for &str {
 impl PartialOrd<Buf<'_>> for &str {
     fn partial_cmp(&self, other: &Buf<'_>) -> Option<cmp::Ordering> {
         <[u8] as PartialOrd<[u8]>>::partial_cmp(self.as_bytes(), other)
+    }
+}
+
+impl bytes::Buf for Buf<'_> {
+    fn remaining(&self) -> usize {
+        self.len()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.as_ref()
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        // no need to care cnt and len, `bytes::Buf` for `&[u8]` and `Bytes` will process it
+        match self {
+            Self::Shm(s) => bytes::Buf::advance(s, cnt),
+            Self::Exm(b) => bytes::Buf::advance(b, cnt),
+        }
     }
 }

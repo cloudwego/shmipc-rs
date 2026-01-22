@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod buf_reader;
+pub mod shmbuf_reader;
 
 /// Determine whether to create new share memory based on the current remaining share memory size.
 ///

@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod buf;
+mod buf;
 pub mod linked;
 pub mod list;
 pub mod manager;
 pub mod slice;
 
-use buf::Buf;
+pub use buf::Buf;
+pub use linked::LinkedBuffer;
+pub use slice::BufferSlice;
 
 use crate::error::Error;
 

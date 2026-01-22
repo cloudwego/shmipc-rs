@@ -19,21 +19,22 @@ pub mod pool;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, LazyLock, Mutex, RwLock,
+        Arc, LazyLock, Mutex, OnceLock, RwLock,
         atomic::{AtomicU32, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::anyhow;
-use config::SessionManagerConfig;
 use futures::future::Either;
-use pool::StreamPool;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     sync::{Notify, mpsc, oneshot},
+    task::JoinHandle,
 };
 
+use self::pool::StreamPool;
+pub use self::{config::SessionManagerConfig, manager::SessionManager};
 use crate::{
     buffer::{
         manager::{BufferManager, add_global_buffer_manager_ref_count},
@@ -63,12 +64,12 @@ static BUF_READER_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
 /// Session is used to wrap a reliable ordered connection and to
 /// multiplex it into multiple streams.
 #[derive(Clone, Debug)]
-pub struct Session {
+pub(crate) struct Session {
     pub(crate) shared: Arc<Shared>,
 }
 
 #[derive(Debug)]
-pub struct Shared {
+pub(crate) struct Shared {
     config: Config,
     /// next_stream_id is the next stream we should send.
     ///
@@ -94,6 +95,19 @@ pub struct Shared {
     pub(crate) shutdown_notify: Notify,
     pub(crate) stats: Stats,
     // pub(crate) peer_addr: SocketAddr,
+    read_loop: OnceLock<JoinHandle<()>>,
+    write_loop: OnceLock<JoinHandle<()>>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Some(handle) = self.read_loop.get() {
+            handle.abort();
+        }
+        if let Some(handle) = self.write_loop.get() {
+            handle.abort();
+        }
+    }
 }
 
 pub struct SendReady {
@@ -245,14 +259,26 @@ impl Session {
                 shutdown_notify: Notify::new(),
                 stats: Stats::default(),
                 // peer_addr,
+                read_loop: OnceLock::new(),
+                write_loop: OnceLock::new(),
             }),
         };
 
         // uds read
-        tokio::spawn(session.clone().read_loop(owned_read_half));
+        session
+            .shared
+            .read_loop
+            .set(tokio::spawn(session.clone().read_loop(owned_read_half)))
+            .unwrap();
 
         // uds write
-        tokio::spawn(session.clone().write_loop(owned_write_half, send_rx));
+        session
+            .shared
+            .write_loop
+            .set(tokio::spawn(
+                session.clone().write_loop(owned_write_half, send_rx),
+            ))
+            .unwrap();
 
         Ok(session)
     }
@@ -455,14 +481,14 @@ impl Session {
     pub async fn recv_loop(
         self,
         mut rx: mpsc::Receiver<Stream>,
-        stream_tx: mpsc::UnboundedSender<std::io::Result<Option<Stream>>>,
+        stream_tx: mpsc::UnboundedSender<std::io::Result<Stream>>,
     ) {
         let mut notified = std::pin::pin!(self.shared.shutdown_notify.notified());
         loop {
             match futures::future::select(std::pin::pin!(rx.recv()), &mut notified).await {
                 Either::Left((res, _)) => {
                     if let Some(stream) = res {
-                        if stream_tx.send(Ok(Some(stream))).is_err() {
+                        if stream_tx.send(Ok(stream)).is_err() {
                             return;
                         }
                     } else {

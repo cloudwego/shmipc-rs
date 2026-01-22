@@ -15,9 +15,11 @@
 use std::os::unix::net::SocketAddr;
 
 use shmipc::{
+    compact::StreamExt,
     session::{SessionManager, SessionManagerConfig},
     transport::DefaultUnixConnect,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() {
@@ -37,21 +39,27 @@ async fn main() {
     let sm = SessionManager::new(conf, DefaultUnixConnect, uds_path)
         .await
         .unwrap();
-    let mut stream = sm.get_stream().unwrap();
+    let stream = sm.get_stream().unwrap();
     let request_msg = "client say hello world!!!";
+
+    let mut conn = StreamExt::new(stream);
+
     println!(
         "size: {}",
-        stream.write_bytes(request_msg.as_bytes()).unwrap()
+        conn.write(request_msg.as_bytes()).await.unwrap(),
     );
-    stream.flush(true).await.unwrap();
-    let resp_msg = stream
-        .read_bytes("server hello world!!!".len())
+    conn.flush().await.unwrap();
+
+    const EXPECTED_RESP: &str = "server hello world!!!";
+    let mut buf = vec![0; 4096];
+
+    conn.read_exact(&mut buf[..EXPECTED_RESP.len()])
         .await
         .unwrap();
     println!(
         "client stream receive response {}",
-        String::from_utf8(resp_msg.to_vec()).unwrap()
+        str::from_utf8(&buf[..EXPECTED_RESP.len()]).unwrap()
     );
-    sm.put_back(stream).await;
+    conn.inner().reuse().await;
     sm.close().await;
 }
