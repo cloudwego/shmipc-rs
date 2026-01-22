@@ -174,12 +174,9 @@ impl BufferManager {
             // file flag don't include os.O_CREATE, because in this case, the share memory should
             // be created by peer.
             let shm_file = OpenOptions::new().read(true).write(true).open(shm_path)?;
-            let fi = shm_file.metadata().map_err(|err| {
-                anyhow!(
-                    "get_global_buffer_manager mapping failed,{}",
-                    err.to_string()
-                )
-            })?;
+            let fi = shm_file
+                .metadata()
+                .map_err(|err| anyhow!("get_global_buffer_manager mapping failed, {err}"))?;
             capacity = fi.len() as u32;
             shm_file
         };
