@@ -12,37 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::VecDeque, sync::Mutex};
+use crossbeam_queue::ArrayQueue;
 
 use crate::{Error, stream::Stream};
 
 #[derive(Debug)]
 pub struct StreamPool {
-    streams: Mutex<VecDeque<Stream>>,
+    streams: ArrayQueue<Stream>,
 }
 
 impl StreamPool {
     pub fn new(pool_capacity: usize) -> Self {
         Self {
-            streams: Mutex::new(VecDeque::with_capacity(pool_capacity)),
+            streams: ArrayQueue::new(pool_capacity),
         }
     }
 
-    pub async fn push(&self, mut stream: Stream) -> Result<(), Error> {
-        {
-            let mut streams = self.streams.lock().unwrap();
-            if streams.len() < streams.capacity() {
-                streams.push_back(stream);
-                return Ok(());
+    pub async fn push(&self, stream: Stream) -> Result<(), Error> {
+        match self.streams.push(stream) {
+            Ok(()) => Ok(()),
+            Err(mut stream) => {
+                stream.safe_close_notify();
+                _ = stream.close().await;
+                Err(Error::StreamPoolFull)
             }
         }
-        stream.safe_close_notify();
-        _ = stream.close().await;
-        Err(Error::StreamPoolFull)
     }
 
     pub fn pop(&self) -> Option<Stream> {
-        self.streams.lock().unwrap().pop_front()
+        self.streams.pop()
     }
 
     pub async fn close(&self) {

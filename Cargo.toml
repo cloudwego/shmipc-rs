@@ -17,6 +17,7 @@ keywords = ["async", "network", "ipc"]
 anyhow = "1"
 arc-swap = "1"
 bytes = "1"
+crossbeam-queue = "0.3"
 fs2 = "0.4"
 futures = "0.3"
 libc = "0.2"
