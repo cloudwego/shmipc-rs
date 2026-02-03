@@ -95,20 +95,29 @@ impl BufferManager {
             return Ok(bm.clone());
         }
         if create {
-            let owned_fd = nix::sys::memfd::memfd_create(
-                CString::new(format!("shmipc{}", buffer_path_name))
-                    .expect("CString::new failed")
-                    .as_c_str(),
-                nix::sys::memfd::MFdFlags::empty(),
-            )
-            .map_err(|err| anyhow!("BufferManager get_with_memfd memfd_create failed: {}", err))?;
-            nix::unistd::ftruncate(&owned_fd, capacity as i64).map_err(|err| {
-                anyhow!(
-                    "BufferManager get_with_memfd truncate share memory failed: {}",
-                    err
+            #[cfg(target_os = "linux")]
+            {
+                let owned_fd = nix::sys::memfd::memfd_create(
+                    CString::new(format!("shmipc{}", buffer_path_name))
+                        .expect("CString::new failed")
+                        .as_c_str(),
+                    nix::sys::memfd::MFdFlags::empty(),
                 )
-            })?;
-            memfd = owned_fd.into_raw_fd();
+                .map_err(|err| {
+                    anyhow!("BufferManager get_with_memfd memfd_create failed: {}", err)
+                })?;
+                nix::unistd::ftruncate(&owned_fd, capacity as i64).map_err(|err| {
+                    anyhow!(
+                        "BufferManager get_with_memfd truncate share memory failed: {}",
+                        err
+                    )
+                })?;
+                memfd = owned_fd.into_raw_fd();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(anyhow!("memfd_create is only supported on Linux"));
+            }
         } else {
             let f_info = nix::sys::stat::fstat(unsafe { BorrowedFd::borrow_raw(memfd) })
                 .map_err(|err| anyhow!("BufferManager get_with_memfd mapping failed: {}", err))?;
@@ -123,7 +132,7 @@ impl BufferManager {
         };
 
         let mut bm = if create {
-            pairs.sort_by(|a, b| a.size.cmp(&b.size));
+            pairs.sort_by_key(|a| a.size);
             Self::create(pairs, buffer_path_name, mem, 0)
         } else {
             Self::mapping(buffer_path_name, mem, 0)
@@ -188,7 +197,7 @@ impl BufferManager {
         };
 
         let bm = if create {
-            pairs.sort_by(|a, b| a.size.cmp(&b.size));
+            pairs.sort_by_key(|a| a.size);
             Self::create(pairs, shm_path, mem, 0)
         } else {
             Self::mapping(shm_path, mem, 0)
