@@ -50,35 +50,42 @@ pub struct QueueManager {
 
 impl QueueManager {
     pub fn create_with_memfd(queue_path_name: &str, queue_cap: u32) -> Result<Self, anyhow::Error> {
-        let memfd = nix::sys::memfd::memfd_create(
-            CString::new(format!("shmipc{}", queue_path_name))
-                .expect("CString::new failed")
-                .as_c_str(),
-            nix::sys::memfd::MFdFlags::empty(),
-        )?;
+        #[cfg(target_os = "linux")]
+        {
+            let memfd = nix::sys::memfd::memfd_create(
+                CString::new(format!("shmipc{}", queue_path_name))
+                    .expect("CString::new failed")
+                    .as_c_str(),
+                nix::sys::memfd::MFdFlags::empty(),
+            )?;
 
-        let mem_size = count_queue_mem_size(queue_cap) * QUEUE_COUNT;
-        nix::unistd::ftruncate(&memfd, mem_size as i64).map_err(|err| {
-            anyhow!(
-                "create_queue_manager_with_memfd truncate share memory failed: {}",
-                err
-            )
-        })?;
+            let mem_size = count_queue_mem_size(queue_cap) * QUEUE_COUNT;
+            nix::unistd::ftruncate(&memfd, mem_size as i64).map_err(|err| {
+                anyhow!(
+                    "create_queue_manager_with_memfd truncate share memory failed: {}",
+                    err
+                )
+            })?;
 
-        let mut mem = unsafe { MmapOptions::new().len(mem_size).map_mut(&memfd)? };
-        mem.fill(0);
+            let mut mem = unsafe { MmapOptions::new().len(mem_size).map_mut(&memfd)? };
+            mem.fill(0);
 
-        Ok(Self {
-            path: queue_path_name.to_owned(),
-            send_queue: Queue::create_from_bytes(mem.as_mut_ptr(), queue_cap),
-            recv_queue: Queue::create_from_bytes(
-                unsafe { mem.as_mut_ptr().add(mem_size / 2) },
-                queue_cap,
-            ),
-            mem,
-            mmap_map_type: MemMapType::MemMapTypeMemFd,
-            memfd: memfd.into_raw_fd(),
-        })
+            Ok(Self {
+                path: queue_path_name.to_owned(),
+                send_queue: Queue::create_from_bytes(mem.as_mut_ptr(), queue_cap),
+                recv_queue: Queue::create_from_bytes(
+                    unsafe { mem.as_mut_ptr().add(mem_size / 2) },
+                    queue_cap,
+                ),
+                mem,
+                mmap_map_type: MemMapType::MemMapTypeMemFd,
+                memfd: memfd.into_raw_fd(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(anyhow!("memfd_create is only supported on Linux"))
+        }
     }
 
     pub fn create_with_file(shm_path: &str, queue_cap: u32) -> Result<Self, anyhow::Error> {
