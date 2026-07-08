@@ -21,7 +21,7 @@ jobs:
       - run: exit 0
 
   lint:
-    runs-on: [self-hosted, Linux, amd64]
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:
@@ -40,7 +40,7 @@ jobs:
           cargo +nightly fmt --all -- --check
 
   docs-check:
-    runs-on: [self-hosted, Linux, amd64]
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:
@@ -56,7 +56,7 @@ jobs:
           cargo rustdoc --all-features --config 'build.rustdocflags=["--cfg", "docsrs"]' -- --deny warnings
 
   test-linux:
-    runs-on: [self-hosted, Linux, amd64]
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:

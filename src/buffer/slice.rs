@@ -196,6 +196,7 @@ impl BufferSlice {
         if is_from_shm && let Some(buffer_header) = header {
             s.cap = buffer_header.cap();
             s.start = buffer_header.start();
+            s.read_index = s.start as usize;
             s.write_index = (s.start + buffer_header.size()) as usize;
             s.buffer_header = Some(buffer_header);
         } else {
@@ -226,6 +227,7 @@ impl BufferSlice {
             buffer_header.set_start(0);
             buffer_header.clear_flag()
         }
+        self.start = 0;
         self.write_index = 0;
         self.read_index = 0;
         self.next_slice = None;

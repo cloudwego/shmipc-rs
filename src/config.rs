@@ -91,7 +91,7 @@ impl Config {
         Self::default()
     }
 
-    pub fn verify(&self) -> Result<(), anyhow::Error> {
+    pub fn verify(&mut self) -> Result<(), anyhow::Error> {
         if self.share_memory_buffer_cap < (1 << 20) {
             return Err(anyhow!(
                 "share memory size is too small:{}, must greater than {}",
@@ -104,7 +104,7 @@ impl Config {
         }
 
         let mut sum = 0;
-        for pair in self.buffer_slice_sizes.iter() {
+        for pair in self.buffer_slice_sizes.iter_mut() {
             sum += pair.percent;
             if pair.size > self.share_memory_buffer_cap {
                 return Err(anyhow!(
@@ -114,11 +114,9 @@ impl Config {
                 ));
             }
 
-            #[cfg(target_arch = "aarch64")]
-            if pair.size % 4 != 0 {
-                return Err(anyhow!(
-                    "the size_percent_pair.size must be a multiple of 4"
-                ));
+            let aligned = (pair.size + 3) & !3;
+            if aligned != pair.size {
+                pair.size = aligned;
             }
         }
 
@@ -128,9 +126,9 @@ impl Config {
             ));
         }
 
-        #[cfg(target_arch = "aarch64")]
-        if self.queue_cap % 8 != 0 {
-            return Err(anyhow!("the queue_cap must be a multiple of 8"));
+        let aligned_queue_cap = (self.queue_cap + 7) & !7;
+        if aligned_queue_cap != self.queue_cap {
+            self.queue_cap = aligned_queue_cap;
         }
 
         if self.share_memory_path_prefix.is_empty() || self.queue_path.is_empty() {
@@ -148,5 +146,34 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, SizePercentPair};
+
+    #[test]
+    fn verify_aligns_buffer_slice_sizes_and_queue_cap() {
+        let mut config = Config {
+            queue_cap: 8193,
+            buffer_slice_sizes: vec![
+                SizePercentPair {
+                    size: 4097,
+                    percent: 50,
+                },
+                SizePercentPair {
+                    size: 8193,
+                    percent: 50,
+                },
+            ],
+            ..Config::default()
+        };
+
+        config.verify().unwrap();
+
+        assert_eq!(8200, config.queue_cap);
+        assert_eq!(4100, config.buffer_slice_sizes[0].size);
+        assert_eq!(8196, config.buffer_slice_sizes[1].size);
     }
 }
