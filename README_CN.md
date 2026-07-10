@@ -96,3 +96,66 @@ benchmark_parallel_ping_pong_by_uds_4194304b
 
 - [HelloWorld客户端](examples/src/hello_world/greeter_client.rs)
 - [HelloWorld服务端](examples/src/hello_world/greeter_server.rs)
+
+#### 协议配置
+
+`Config::default()` 保持 legacy 行为：file-path 共享内存使用 V2 协议，memfd 共享内存使用 V3
+协议。V4 需要通过嵌套的 protocol 配置显式启用：
+
+```rust
+use std::time::Duration;
+
+use shmipc::{config::Config, session::SessionManagerConfig};
+
+let legacy = Config::default();
+let v4 = Config::default().with_v4();
+let v4_eventfd = Config::default().with_v4_eventfd();
+let v4_polling = Config::default().with_v4_event_queue_polling(Duration::from_micros(100));
+
+let sm_config = SessionManagerConfig::new().with_config(v4_eventfd);
+```
+
+模式选择：
+
+| 模式 | 配置 | 适用场景 |
+| ---- | ---- | -------- |
+| Legacy V2/V3 | `Config::default()` | 现有部署和灰度升级。 |
+| V4 default | `Config::default().with_v4()` | 首次接入 V4 的推荐起点，仍使用 Unix socket polling wakeup。 |
+| V4 eventfd | `Config::default().with_v4_eventfd()` | Linux memfd 场景下的小包低延迟推荐模式。 |
+| V4 polling | `Config::default().with_v4_event_queue_polling(interval)` | 减少每条消息的 wakeup 流量；延迟受协商出的 polling interval 和 OS timer 行为影响。 |
+
+服务端接入说明：
+
+- 服务端使用 `Config::default()` 即可同时接受 legacy V2/V3 客户端和 V4 客户端。V4 可选
+  wakeup feature 会根据客户端请求协商选择。
+- `eventfd_wakeup` 要求 memfd 共享内存。`MemMapType` 默认就是 memfd；如果客户端需要 V4
+  eventfd，不要把服务端切到 `MemMapTypeDevShmFile`。
+- polling interval 来自 V4 客户端请求，协商后 client/server 两侧共同使用。
+- V4 helper 默认设置 `fallback = true`。客户端仅在 V4 初始化遇到网络/协议失败时回退到
+  legacy V3；如果服务端显式拒绝 V4 negotiation，会直接返回错误，不会静默降级。如果不希望
+  自动降级，可设置 `config.protocol.mode = ProtocolMode::V4 { fallback: false }`。
+
+现有示例服务端可直接配合以下 V4 客户端使用：
+
+- [V4 default 客户端](examples/src/hello_world/greeter_client_v4_default.rs)
+- [V4 eventfd 客户端](examples/src/hello_world/greeter_client_v4_eventfd.rs)
+- [V4 polling 客户端](examples/src/hello_world/greeter_client_v4_polling.rs)
+
+从 `examples` package 运行：
+
+```bash
+cargo run -p examples --bin greeter_server
+cargo run -p examples --bin greeter_client_v4_default
+cargo run -p examples --bin greeter_client_v4_eventfd
+cargo run -p examples --bin greeter_client_v4_polling
+```
+
+如果使用 struct literal 构造 `Config`，需要显式填写 `protocol`，或者使用
+`..Config::default()` 保留默认字段，避免升级后遗漏新增配置项。
+
+#### 关闭语义
+
+`Stream::flush()` 的语义是数据已在本端入队，并按协商出的 wakeup 机制尝试通知对端；它不表示
+对端已经 drain 共享内存队列或已经读到这些字节。`SessionManager::close()` 以及 listener/session
+关闭路径是 hard close。如果应用要求最后一帧在关闭前一定被对端读到，需要在关闭 session 前做应用层
+ack 或 completion barrier。

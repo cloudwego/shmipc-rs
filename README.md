@@ -99,3 +99,68 @@ benchmark_parallel_ping_pong_by_uds_4194304b
 
 - [HelloWorldClient](examples/src/hello_world/greeter_client.rs)
 - [HelloWorldServer](examples/src/hello_world/greeter_server.rs)
+
+#### Protocol configuration
+
+`Config::default()` keeps the legacy behavior: file-path shared memory uses the V2 protocol and
+memfd shared memory uses the V3 protocol. V4 is opt-in through the nested protocol config helpers:
+
+```rust
+use std::time::Duration;
+
+use shmipc::{config::Config, session::SessionManagerConfig};
+
+let legacy = Config::default();
+let v4 = Config::default().with_v4();
+let v4_eventfd = Config::default().with_v4_eventfd();
+let v4_polling = Config::default().with_v4_event_queue_polling(Duration::from_micros(100));
+
+let sm_config = SessionManagerConfig::new().with_config(v4_eventfd);
+```
+
+Mode selection:
+
+| Mode | Config | When to use |
+| ---- | ------ | ----------- |
+| Legacy V2/V3 | `Config::default()` | Existing deployments and gradual upgrades. |
+| V4 default | `Config::default().with_v4()` | First V4 rollout step; keeps the Unix-socket polling wakeup path. |
+| V4 eventfd | `Config::default().with_v4_eventfd()` | Recommended V4 mode for low-latency small-message workloads on Linux memfd. |
+| V4 polling | `Config::default().with_v4_event_queue_polling(interval)` | Reduces per-message wakeup traffic; latency is bounded by the negotiated polling interval and OS timer behavior. |
+
+Server-side notes:
+
+- A server using `Config::default()` can accept legacy V2/V3 clients and V4 clients. V4 optional
+  wakeup features are selected from the client request.
+- `eventfd_wakeup` requires memfd shared memory. This is the default `MemMapType`; do not switch the
+  server to `MemMapTypeDevShmFile` if clients need V4 eventfd.
+- The polling interval is negotiated from the V4 client request and used by both peers.
+- The V4 helpers set `fallback = true`. A client falls back to legacy V3 only when initial V4 setup
+  fails with a network/protocol failure. Explicit negotiation rejections are returned as errors.
+  Set `config.protocol.mode = ProtocolMode::V4 { fallback: false }` when silent downgrade is not
+  desired.
+
+The example server can be used with the V4 clients:
+
+- [V4 default client](examples/src/hello_world/greeter_client_v4_default.rs)
+- [V4 eventfd client](examples/src/hello_world/greeter_client_v4_eventfd.rs)
+- [V4 polling client](examples/src/hello_world/greeter_client_v4_polling.rs)
+
+Run them from the `examples` package:
+
+```bash
+cargo run -p examples --bin greeter_server
+cargo run -p examples --bin greeter_client_v4_default
+cargo run -p examples --bin greeter_client_v4_eventfd
+cargo run -p examples --bin greeter_client_v4_polling
+```
+
+When constructing `Config` with a struct literal, include `protocol` explicitly or use
+`..Config::default()` so future config fields keep their defaults.
+
+#### Close semantics
+
+`Stream::flush()` means that data has been enqueued locally and the negotiated wakeup mechanism has
+been attempted. It does not mean that the peer has already drained the shared-memory queue or read
+the bytes. `SessionManager::close()` and listener/session close paths are hard closes. If the last
+application frame must be delivered before shutdown, use an application-level acknowledgement or
+completion barrier before closing the session.

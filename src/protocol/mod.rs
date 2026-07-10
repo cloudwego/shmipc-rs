@@ -15,8 +15,10 @@
 pub mod adapter;
 pub mod block_io;
 pub mod event;
+pub mod event_fd;
 pub mod header;
 pub mod initializer;
+pub mod negotiation;
 
 use std::{
     os::fd::RawFd,
@@ -27,10 +29,11 @@ use std::{
 use adapter::{ClientProtocolAdapter, ServerProtocolAdapter};
 use anyhow::anyhow;
 use header::Header;
+use initializer::ProtocolInitialized;
 
 use crate::{
     buffer::manager::BufferManager,
-    config::Config,
+    config::{Config, ProtocolMode},
     consts::{BUFFER_PATH_SUFFIX, MemMapType},
     queue::QueueManager,
 };
@@ -54,6 +57,7 @@ pub fn protocol_trace(h: &Header, body: &[u8], send: bool) {
 
 pub fn init_manager(
     config: &mut Config,
+    proto_version: u8,
 ) -> Result<(Arc<BufferManager>, QueueManager), anyhow::Error> {
     Ok(match config.mem_map_type {
         MemMapType::MemMapTypeDevShmFile => {
@@ -75,7 +79,11 @@ pub fn init_manager(
                     ));
                 }
             };
-            let qm = match QueueManager::create_with_file(&config.queue_path, config.queue_cap) {
+            let qm = match QueueManager::create_with_file(
+                &config.queue_path,
+                config.queue_cap,
+                proto_version,
+            ) {
                 Ok(manager) => manager,
                 Err(err) => {
                     _ = std::fs::remove_dir(&config.queue_path);
@@ -103,7 +111,11 @@ pub fn init_manager(
                     ));
                 }
             };
-            let qm = match QueueManager::create_with_memfd(&config.queue_path, config.queue_cap) {
+            let qm = match QueueManager::create_with_memfd(
+                &config.queue_path,
+                config.queue_cap,
+                proto_version,
+            ) {
                 Ok(manager) => manager,
                 Err(err) => {
                     return Err(anyhow!(
@@ -117,28 +129,37 @@ pub fn init_manager(
     })
 }
 
+pub const fn initial_client_proto_version(config: &Config) -> u8 {
+    match config.protocol.mode {
+        ProtocolMode::Legacy => match config.mem_map_type {
+            MemMapType::MemMapTypeDevShmFile => 2,
+            MemMapType::MemMapTypeMemFd => 3,
+        },
+        ProtocolMode::V4 { .. } => 4,
+    }
+}
+
 pub async fn init_client_protocol(
     buffer_path: String,
     buffer_memfd: RawFd,
     queue_path: String,
     queue_memfd: RawFd,
     conn_fd: RawFd,
-    mem_map_type: MemMapType,
+    config: Config,
     timeout: Duration,
-) -> Result<u8, anyhow::Error> {
+) -> Result<ProtocolInitialized, anyhow::Error> {
     tracing::info!("starting initializes shmipc client protocol");
     let handler = tokio::task::spawn_blocking(move || {
         let adapter = ClientProtocolAdapter::new(
             conn_fd,
-            mem_map_type,
+            config,
             buffer_path,
             queue_path,
             buffer_memfd,
             queue_memfd,
         );
         let initializer = adapter.get_initializer()?;
-        initializer.init()?;
-        Ok::<_, anyhow::Error>(initializer.version())
+        initializer.init()
     });
     match tokio::time::timeout(timeout, std::pin::pin!(handler)).await {
         Ok(res) => res?,
@@ -152,13 +173,12 @@ pub async fn init_client_protocol(
 pub async fn init_server_protocol(
     conn_fd: RawFd,
     timeout: Duration,
-) -> Result<(Arc<BufferManager>, QueueManager, u8), anyhow::Error> {
+) -> Result<ProtocolInitialized, anyhow::Error> {
     tracing::info!("starting initializes shmipc server protocol");
     let handler = tokio::task::spawn_blocking(move || {
         let adapter = ServerProtocolAdapter::new(conn_fd);
         let initializer = adapter.get_initializer()?;
-        let (bm, qm) = initializer.init()?.unwrap();
-        Ok((bm, qm, initializer.version()))
+        initializer.init()
     });
     match tokio::time::timeout(timeout, std::pin::pin!(handler)).await {
         Ok(res) => res?,

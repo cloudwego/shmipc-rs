@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{os::fd::RawFd, sync::Arc};
+use std::os::fd::RawFd;
 
 use anyhow::anyhow;
 
-use super::{handle_share_memory_by_file_path, send_share_memory_by_file_path};
-use crate::{
-    buffer::manager::BufferManager,
-    protocol::{event::EventType, header::Header},
-    queue::QueueManager,
+use super::{
+    ProtocolInitialized, handle_share_memory_by_file_path, send_share_memory_by_file_path,
 };
+use crate::protocol::{event::EventType, header::Header};
 
 pub enum ProtocolInitializerV2 {
     Client(Client),
@@ -29,15 +27,11 @@ pub enum ProtocolInitializerV2 {
 }
 
 impl ProtocolInitializerV2 {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
         match self {
             ProtocolInitializerV2::Client(client) => client.init(),
             ProtocolInitializerV2::Server(server) => server.init(),
         }
-    }
-
-    pub const fn version() -> u8 {
-        2
     }
 }
 
@@ -48,8 +42,9 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
-        send_share_memory_by_file_path(self.conn_fd, &self.buffer_path, &self.queue_path, 2)
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
+        send_share_memory_by_file_path(self.conn_fd, &self.buffer_path, &self.queue_path, 2)?;
+        Ok(ProtocolInitialized::legacy(None, 2))
     }
 }
 
@@ -59,7 +54,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
         if self.first_event.msg_type() != EventType::TYPE_SHARE_MEMORY_BY_FILE_PATH {
             return Err(anyhow!(
                 "ProtocolInitializerV2 expect first event is:{}({}),but:{}",
@@ -68,6 +63,9 @@ impl Server {
                 self.first_event.msg_type().inner()
             ));
         }
-        handle_share_memory_by_file_path(self.conn_fd, &self.first_event)
+        Ok(ProtocolInitialized::legacy(
+            handle_share_memory_by_file_path(self.conn_fd, &self.first_event, 2)?,
+            2,
+        ))
     }
 }

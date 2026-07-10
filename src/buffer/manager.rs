@@ -17,8 +17,7 @@ use std::{
     ffi::CString,
     fs::{self, OpenOptions, Permissions},
     os::{
-        fd::{BorrowedFd, IntoRawFd, RawFd},
-        raw::c_void,
+        fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
         unix::prelude::PermissionsExt,
     },
     path::Path,
@@ -31,7 +30,6 @@ use std::{
 
 use anyhow::anyhow;
 use memmap2::{MmapMut, MmapOptions};
-use nix::libc::munmap;
 
 use super::list::BufferList;
 use crate::{
@@ -206,15 +204,17 @@ impl BufferManager {
         let mem = unsafe {
             MmapOptions::new()
                 .len(capacity as usize)
-                .map_mut(shm_file.into_raw_fd())?
+                .map_mut(shm_file.as_raw_fd())?
         };
 
-        let bm = if create {
+        let mut bm = if create {
             pairs.sort_by_key(|a| a.size);
             Self::create(pairs, shm_path, mem, 0)
         } else {
             Self::mapping(shm_path, mem, 0)
         }?;
+        bm.mem_map_type = MemMapType::MemMapTypeDevShmFile;
+        bm.memfd = 0;
 
         let bm = Arc::new(bm);
         bms.insert(shm_path.to_owned(), bm.clone());
@@ -563,7 +563,6 @@ impl BufferManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        unsafe { munmap(self.mem.as_ptr() as *mut c_void, self.mem.len()) };
         if let MemMapType::MemMapTypeDevShmFile = self.mem_map_type {
             if let Err(e) = std::fs::remove_file(&self.path) {
                 tracing::warn!(

@@ -226,7 +226,7 @@ impl Stream {
         let mut event = FallbackDataEvent([0u8; 16].as_mut_ptr());
         event.encode(
             buf_len as u32 + 16,
-            self.session.shared.communication_version,
+            self.session.shared.msg_version,
             self.id,
             stream_status,
         );
@@ -425,7 +425,7 @@ impl Stream {
             let ptr = event.as_mut_ptr();
             copy_nonoverlapping(12_u32.to_be_bytes().as_ptr(), ptr, 4);
             copy_nonoverlapping(MAGIC_NUMBER.to_be_bytes().as_ptr(), ptr.offset(4), 2);
-            *ptr.offset(6) = self.session.shared.communication_version;
+            *ptr.offset(6) = self.session.shared.msg_version;
             *ptr.offset(7) = EventType::TYPE_STREAM_CLOSE.inner();
             copy_nonoverlapping(self.id.to_be_bytes().as_ptr(), ptr.offset(8), 4);
         }

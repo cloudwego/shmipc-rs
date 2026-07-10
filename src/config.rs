@@ -27,8 +27,19 @@ pub struct SizePercentPair {
     pub percent: u32,
 }
 
-#[derive(Debug, Clone)]
 /// Config is used to tune the shmipc session
+///
+/// `Config::default()` preserves the legacy protocol behavior:
+///
+/// - [`MemMapType::MemMapTypeDevShmFile`] uses the V2 protocol.
+/// - [`MemMapType::MemMapTypeMemFd`] uses the V3 protocol.
+///
+/// V4 is opt-in through [`Config::with_v4`], [`Config::with_v4_eventfd`], or
+/// [`Config::with_v4_event_queue_polling`]. Server-side V4 feature selection is negotiated from
+/// the client request, so a server using the default protocol config can accept legacy and V4
+/// clients. If a server is configured with [`MemMapType::MemMapTypeDevShmFile`], V4 eventfd
+/// requests are rejected because eventfd negotiation requires memfd fd-passing.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// connection_write_timeout is meant to be a "safety value" timeout after
     /// which we will suspect a problem with the underlying connection and
@@ -65,6 +76,65 @@ pub struct Config {
     pub rebuild_interval: Duration,
 
     pub max_stream_num: usize,
+
+    /// Protocol and wakeup negotiation settings.
+    ///
+    /// Keep this as [`ProtocolConfig::default`] for legacy behavior. Set it explicitly only when
+    /// the client should initiate V4 negotiation.
+    pub protocol: ProtocolConfig,
+}
+
+/// Protocol-level configuration.
+///
+/// `mode` chooses legacy vs V4 negotiation. `wakeup` selects an optional V4 wakeup feature. Wakeup
+/// features are only valid with [`ProtocolMode::V4`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProtocolConfig {
+    /// Protocol negotiation mode.
+    pub mode: ProtocolMode,
+    /// Optional wakeup feature requested by the client during V4 negotiation.
+    pub wakeup: WakeupMode,
+}
+
+/// Protocol negotiation mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ProtocolMode {
+    /// Preserve the pre-V4 behavior.
+    ///
+    /// File-path shared memory uses V2 and memfd shared memory uses V3.
+    #[default]
+    Legacy,
+    /// Use Go-compatible V4 JSON negotiation.
+    ///
+    /// When `fallback` is `true`, a client reconnects and falls back to legacy V3 only if the V4
+    /// initialization failed because of a network/protocol failure. An explicit V4 negotiation
+    /// rejection, such as `VERSION_NOT_SUPPORTED`, is returned to the caller instead of being
+    /// silently downgraded.
+    V4 {
+        /// Whether a client should reconnect and retry legacy V3 after network/protocol failures
+        /// during initial V4 setup.
+        fallback: bool,
+    },
+}
+
+/// Optional V4 wakeup feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum WakeupMode {
+    /// Use the legacy Unix-socket polling message wakeup path.
+    #[default]
+    Default,
+    /// Let the peer periodically drain the shared-memory queue instead of sending a wakeup per
+    /// queue element.
+    ///
+    /// The interval is encoded into the V4 negotiation request and both sides use the negotiated
+    /// interval. Lower intervals reduce latency but increase timer activity. The interval must be
+    /// greater than zero.
+    EventQueuePolling { interval: Duration },
+    /// Use Linux `eventfd` for queue wakeups.
+    ///
+    /// This mode requires [`MemMapType::MemMapTypeMemFd`] because V4 eventfd negotiation passes
+    /// four file descriptors: buffer fd, queue fd, and two eventfds.
+    EventFd,
 }
 
 impl Default for Config {
@@ -82,6 +152,7 @@ impl Default for Config {
             mem_map_type: Default::default(),
             rebuild_interval: SESSION_REBUILD_INTERVAL,
             max_stream_num: 4096,
+            protocol: ProtocolConfig::default(),
         }
     }
 }
@@ -91,7 +162,58 @@ impl Config {
         Self::default()
     }
 
+    /// Enable V4 negotiation with the default Unix-socket polling wakeup path.
+    ///
+    /// The helper sets [`ProtocolMode::V4`] with `fallback = true` and keeps
+    /// [`WakeupMode::Default`].
+    pub fn with_v4(mut self) -> Self {
+        self.protocol.mode = ProtocolMode::V4 { fallback: true };
+        self
+    }
+
+    /// Enable V4 negotiation and request Linux `eventfd` wakeups.
+    ///
+    /// This is the recommended V4 mode for low-latency small-message workloads when both peers use
+    /// memfd shared memory.
+    pub fn with_v4_eventfd(mut self) -> Self {
+        self.protocol.mode = ProtocolMode::V4 { fallback: true };
+        self.protocol.wakeup = WakeupMode::EventFd;
+        self
+    }
+
+    /// Enable V4 negotiation and request periodic queue polling.
+    ///
+    /// Use this when reducing per-message wakeup traffic is more important than immediate
+    /// delivery. The interval must be greater than zero and is shared with the peer through V4
+    /// negotiation.
+    pub fn with_v4_event_queue_polling(mut self, interval: Duration) -> Self {
+        self.protocol.mode = ProtocolMode::V4 { fallback: true };
+        self.protocol.wakeup = WakeupMode::EventQueuePolling { interval };
+        self
+    }
+
     pub fn verify(&mut self) -> Result<(), anyhow::Error> {
+        if matches!(self.protocol.mode, ProtocolMode::Legacy)
+            && !matches!(self.protocol.wakeup, WakeupMode::Default)
+        {
+            return Err(anyhow!(
+                "wakeup features require ProtocolMode::V4; legacy mode cannot enable {:?}",
+                self.protocol.wakeup
+            ));
+        }
+        if let WakeupMode::EventQueuePolling { interval } = self.protocol.wakeup
+            && interval.is_zero()
+        {
+            return Err(anyhow!(
+                "event_queue_polling interval must be greater than zero"
+            ));
+        }
+        if matches!(self.protocol.wakeup, WakeupMode::EventFd)
+            && !matches!(self.mem_map_type, MemMapType::MemMapTypeMemFd)
+        {
+            return Err(anyhow!("eventfd wakeup requires memfd shared memory"));
+        }
+
         if self.share_memory_buffer_cap < (1 << 20) {
             return Err(anyhow!(
                 "share memory size is too small:{}, must greater than {}",
@@ -151,7 +273,9 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, SizePercentPair};
+    use std::time::Duration;
+
+    use super::{Config, ProtocolMode, SizePercentPair, WakeupMode};
 
     #[test]
     fn verify_aligns_buffer_slice_sizes_and_queue_cap() {
@@ -175,5 +299,38 @@ mod tests {
         assert_eq!(8200, config.queue_cap);
         assert_eq!(4100, config.buffer_slice_sizes[0].size);
         assert_eq!(8196, config.buffer_slice_sizes[1].size);
+    }
+
+    #[test]
+    fn verify_rejects_wakeup_features_in_legacy_mode() {
+        let mut config = Config::default().with_v4_event_queue_polling(Duration::from_micros(100));
+        config.protocol.mode = ProtocolMode::Legacy;
+
+        assert!(config.verify().is_err());
+    }
+
+    #[test]
+    fn verify_rejects_zero_polling_interval() {
+        let mut config = Config::default().with_v4_event_queue_polling(Duration::ZERO);
+
+        assert!(config.verify().is_err());
+    }
+
+    #[test]
+    fn verify_rejects_eventfd_without_memfd() {
+        let mut config = Config {
+            mem_map_type: crate::consts::MemMapType::MemMapTypeDevShmFile,
+            ..Config::default().with_v4_eventfd()
+        };
+
+        assert!(config.verify().is_err());
+    }
+
+    #[test]
+    fn v4_helpers_set_protocol_config() {
+        let config = Config::default().with_v4_eventfd();
+
+        assert_eq!(ProtocolMode::V4 { fallback: true }, config.protocol.mode);
+        assert_eq!(WakeupMode::EventFd, config.protocol.wakeup);
     }
 }

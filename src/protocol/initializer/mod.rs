@@ -14,19 +14,22 @@
 
 pub mod v2;
 pub mod v3;
+pub mod v4;
 
 use std::{os::fd::RawFd, sync::Arc};
 
 use anyhow::anyhow;
 
-use self::{v2::ProtocolInitializerV2, v3::ProtocolInitializerV3};
+use self::{v2::ProtocolInitializerV2, v3::ProtocolInitializerV3, v4::ProtocolInitializerV4};
 use super::{block_io::block_write_full, event::check_event_valid, header::Header, protocol_trace};
 use crate::{
     buffer::manager::BufferManager,
-    consts::{HEADER_SIZE, MAX_SUPPORT_PROTO_VERSION, MEMFD_COUNT},
+    consts::{HEADER_SIZE, MAX_LEGACY_PROTO_VERSION, MEMFD_COUNT},
     protocol::{
         block_io::{block_read_full, block_read_out_of_bound_for_fd, send_fd},
         event::EventType,
+        event_fd::EventFdPair,
+        negotiation::NegotiatedFeature,
     },
     queue::QueueManager,
 };
@@ -34,20 +37,51 @@ use crate::{
 pub enum ProtocolInitializer {
     V2(ProtocolInitializerV2),
     V3(ProtocolInitializerV3),
+    V4(ProtocolInitializerV4),
 }
 
-impl ProtocolInitializer {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
-        match self {
-            ProtocolInitializer::V2(v2) => v2.init(),
-            ProtocolInitializer::V3(v3) => v3.init(),
+pub struct ProtocolInitialized {
+    pub shared_memory: Option<(Arc<BufferManager>, QueueManager)>,
+    pub proto_version: u8,
+    pub msg_version: u8,
+    pub feature: NegotiatedFeature,
+    pub eventfd: Option<EventFdPair>,
+}
+
+impl ProtocolInitialized {
+    pub fn new(
+        shared_memory: Option<(Arc<BufferManager>, QueueManager)>,
+        proto_version: u8,
+        msg_version: u8,
+        feature: NegotiatedFeature,
+        eventfd: Option<EventFdPair>,
+    ) -> Self {
+        Self {
+            shared_memory,
+            proto_version,
+            msg_version,
+            feature,
+            eventfd,
         }
     }
 
-    pub const fn version(&self) -> u8 {
+    pub fn legacy(shared_memory: Option<(Arc<BufferManager>, QueueManager)>, version: u8) -> Self {
+        Self::new(
+            shared_memory,
+            version,
+            version,
+            NegotiatedFeature::None,
+            None,
+        )
+    }
+}
+
+impl ProtocolInitializer {
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
         match self {
-            ProtocolInitializer::V2(_) => ProtocolInitializerV2::version(),
-            ProtocolInitializer::V3(_) => ProtocolInitializerV3::version(),
+            ProtocolInitializer::V2(v2) => v2.init(),
+            ProtocolInitializer::V3(v3) => v3.init(),
+            ProtocolInitializer::V4(v4) => v4.init(),
         }
     }
 }
@@ -56,7 +90,7 @@ pub fn handle_exchange_version(conn_fd: RawFd) -> Result<(), anyhow::Error> {
     let mut resp_header = Header([0; HEADER_SIZE].as_mut_ptr());
     resp_header.encode(
         HEADER_SIZE as u32,
-        MAX_SUPPORT_PROTO_VERSION,
+        MAX_LEGACY_PROTO_VERSION,
         EventType::TYPE_EXCHANGE_PROTO_VERSION,
     );
     protocol_trace(&resp_header, &[], true);
@@ -68,8 +102,26 @@ pub fn handle_exchange_version(conn_fd: RawFd) -> Result<(), anyhow::Error> {
 pub fn handle_share_memory_by_memfd(
     conn_fd: RawFd,
     h: &Header,
-    version: u8,
+    proto_version: u8,
+    msg_version: u8,
 ) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    let (bm, qm, _) = handle_share_memory_by_memfd_with_expected(
+        conn_fd,
+        h,
+        proto_version,
+        msg_version,
+        MEMFD_COUNT,
+    )?;
+    Ok(Some((bm, qm)))
+}
+
+pub fn handle_share_memory_by_memfd_with_expected(
+    conn_fd: RawFd,
+    h: &Header,
+    proto_version: u8,
+    msg_version: u8,
+    expected_fd_count: usize,
+) -> Result<(Arc<BufferManager>, QueueManager, Vec<RawFd>), anyhow::Error> {
     tracing::info!("recv memfd, header:{}", h);
     // 1.recv shm metadata
     let mut body = vec![0u8; h.length() as usize - HEADER_SIZE];
@@ -81,7 +133,7 @@ pub fn handle_share_memory_by_memfd(
     let mut ack = Header([0; HEADER_SIZE].as_mut_ptr());
     ack.encode(
         HEADER_SIZE as u32,
-        version,
+        msg_version,
         EventType::TYPE_ACK_READY_RECV_FD,
     );
     tracing::info!("response typeAckReadyRecvFD");
@@ -93,11 +145,7 @@ pub fn handle_share_memory_by_memfd(
 
     // 3. recv fd
     tracing::info!("send ack finished");
-    let fds = block_read_out_of_bound_for_fd(conn_fd)?;
-    if fds.len() < MEMFD_COUNT {
-        tracing::warn!("ParseUnixRights len fds:{}", fds.len());
-        return Err(anyhow!("the number of memfd received is wrong"));
-    }
+    let fds = block_read_out_of_bound_for_fd(conn_fd, expected_fd_count)?;
 
     let (buffer_fd, queue_fd) = (fds[0], fds[1]);
     tracing::info!(
@@ -109,14 +157,14 @@ pub fn handle_share_memory_by_memfd(
     );
 
     // 4. mapping share memory
-    let qm = QueueManager::mapping_with_memfd(queue_path, queue_fd)?;
+    let qm = QueueManager::mapping_with_memfd(queue_path, queue_fd, proto_version)?;
     let bm = BufferManager::get_with_memfd(buffer_path, buffer_fd, 0, false, &mut []).inspect_err(
         |_| {
             qm.unmap();
         },
     )?;
     tracing::info!("handle_share_memory_by_memfd done");
-    Ok(Some((bm, qm)))
+    Ok((bm, qm, fds))
 }
 
 pub fn send_memfd_to_peer(
@@ -125,6 +173,26 @@ pub fn send_memfd_to_peer(
     buffer_fd: RawFd,
     queue_path: &str,
     queue_fd: RawFd,
+    version: u8,
+) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    send_memfd_to_peer_with_fds(
+        conn_fd,
+        buffer_path,
+        buffer_fd,
+        queue_path,
+        queue_fd,
+        &[],
+        version,
+    )
+}
+
+pub fn send_memfd_to_peer_with_fds(
+    conn_fd: RawFd,
+    buffer_path: &str,
+    buffer_fd: RawFd,
+    queue_path: &str,
+    queue_fd: RawFd,
+    extra_fds: &[RawFd],
     version: u8,
 ) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
     let mut event = generate_shm_metadata(
@@ -145,7 +213,11 @@ pub fn send_memfd_to_peer(
     block_write_full(conn_fd, &event)?;
     let mut buf = [0u8; HEADER_SIZE];
     wait_event_header(conn_fd, EventType::TYPE_ACK_READY_RECV_FD, &mut buf)?;
-    send_fd(conn_fd, &[buffer_fd, queue_fd])?;
+    let mut fds = Vec::with_capacity(MEMFD_COUNT + extra_fds.len());
+    fds.push(buffer_fd);
+    fds.push(queue_fd);
+    fds.extend_from_slice(extra_fds);
+    send_fd(conn_fd, &fds)?;
     Ok(None)
 }
 
@@ -178,6 +250,7 @@ pub fn block_read_event_header(conn_fd: RawFd, buf: &mut [u8]) -> Result<Header,
 pub fn handle_share_memory_by_file_path(
     conn_fd: RawFd,
     hdr: &Header,
+    proto_version: u8,
 ) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
     tracing::info!("handle_share_memory_by_file_path head:{:?}", hdr);
     let mut body = vec![0u8; hdr.length() as usize - HEADER_SIZE];
@@ -191,7 +264,7 @@ pub fn handle_share_memory_by_file_path(
         return Err(err);
     }
     let (buffer_path, queue_path) = extract_shm_metadata(&body);
-    let qm = QueueManager::mapping_with_file(queue_path).map_err(|err| {
+    let qm = QueueManager::mapping_with_file(queue_path, proto_version).map_err(|err| {
         anyhow!(
             "handle_share_memory_by_file_path mappingQueueManager failed,queuePathLen:{} path:{} \
              err={}",

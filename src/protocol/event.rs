@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub const MIN_EVENT_TYPE: EventType = EventType::TYPE_SHARE_MEMORY_BY_FILE_PATH;
-pub const MAX_EVENT_TYPE: EventType = EventType::TYPE_HOT_RESTART_ACK;
+pub const MAX_EVENT_TYPE: EventType = EventType::TYPE_NEGOTIATION;
 
 pub static POLLING_EVENT_WITH_VERSION: LazyLock<Vec<Vec<u8>>> = LazyLock::new(|| {
     let mut events = Vec::with_capacity(MAX_SUPPORT_PROTO_VERSION as usize + 1);
@@ -65,6 +65,8 @@ impl EventType {
 
     pub const TYPE_HOT_RESTART_ACK: Self = Self(9);
 
+    pub const TYPE_NEGOTIATION: Self = Self(10);
+
     pub fn inner(&self) -> u8 {
         self.0
     }
@@ -83,6 +85,7 @@ impl From<u8> for EventType {
             7 => EventType::TYPE_ACK_READY_RECV_FD,
             8 => EventType::TYPE_HOT_RESTART,
             9 => EventType::TYPE_HOT_RESTART_ACK,
+            10 => EventType::TYPE_NEGOTIATION,
             i => Self(i),
         }
     }
@@ -102,6 +105,7 @@ impl Display for EventType {
             7 => "AckReadyRecvFD",
             8 => "HotRestart",
             9 => "HotRestartAck",
+            10 => "Negotiation",
             i => {
                 unset.push_str(&format!("{i}"));
                 &unset
@@ -140,7 +144,7 @@ impl FallbackDataEvent {
 
 pub fn check_event_valid(hdr: &Header) -> Result<(), Error> {
     // Verify the magic & version
-    if hdr.magic() != MAGIC_NUMBER || hdr.version() == 0 {
+    if hdr.magic() != MAGIC_NUMBER || hdr.version() > MAX_SUPPORT_PROTO_VERSION {
         tracing::error!(
             "shmipc: Invalid magic or version {} {}",
             hdr.magic(),
