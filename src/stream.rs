@@ -163,18 +163,32 @@ impl Stream {
                 let slice = match self.session.shared.buffer_manager.read_buffer_slice(offset) {
                     Ok(slice) => slice,
                     Err(err) => {
-                        // it means that something bug about protocol occurred, underlying
-                        // connection will be closed.
                         tracing::error!("read_buffer_slice error {err}");
                         break;
                     }
                 };
-                if !slice
+                let has_next = slice
                     .buffer_header
                     .as_ref()
                     .map(|h| h.has_next())
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if slice.size() == 0 {
+                    let next_offset = slice.buffer_header.as_ref().unwrap().next_buffer_offset();
+                    self.session.shared.buffer_manager.recycle_buffer(slice);
+                    if has_next {
+                        offset = next_offset;
+                        continue;
+                    } else {
+                        if let Some(back) = buf.slice_list().back()
+                            && let Some(bh) = &back.buffer_header
+                        {
+                            bh.clear_flag();
+                            bh.set_in_used();
+                        }
+                        break;
+                    }
+                }
+                if !has_next {
                     buf.append_buffer_slice(slice);
                     break;
                 }
@@ -195,18 +209,23 @@ impl Stream {
         err: Error,
         send_buf: &mut LinkedBuffer,
     ) -> Result<(), Error> {
+        let buf_len = send_buf.len();
+        if buf_len > u32::MAX as usize - 16 {
+            send_buf.recycle();
+            return Err(Error::NoMoreBuffer);
+        }
         tracing::warn!(
             "session {} stream fallback seqID:{} len:{} reason:{}, send_buf.is_from_share_memory: \
              {}",
             self.session.shared.name,
             self.id,
-            send_buf.len(),
+            buf_len,
             err,
             send_buf.is_from_share_memory()
         );
         let mut event = FallbackDataEvent([0u8; 16].as_mut_ptr());
         event.encode(
-            send_buf.len() as u32 + 16,
+            buf_len as u32 + 16,
             self.session.shared.communication_version,
             self.id,
             stream_status,
@@ -378,26 +397,28 @@ impl Stream {
         if self.session.shared.shutdown.load(Ordering::SeqCst) == 1 {
             return Ok(());
         }
-        // notify peer
-        if self
-            .session
-            .shared
-            .queue_manager
-            .send_queue
-            .put(QueueElement {
-                seq_id: self.id,
-                offset_in_shm_buf: 0,
-                status: STREAM_CLOSED,
-            })
-            .is_ok()
-        {
-            return self.session.wake_up_peer().await;
+        if !self.inner.in_fallback_state.load(Ordering::SeqCst) {
+            if self
+                .session
+                .shared
+                .queue_manager
+                .send_queue
+                .put(QueueElement {
+                    seq_id: self.id,
+                    offset_in_shm_buf: 0,
+                    status: STREAM_CLOSED,
+                })
+                .is_ok()
+            {
+                return self.session.wake_up_peer().await;
+            }
+            self.session
+                .shared
+                .stats
+                .queue_full_error_count
+                .fetch_add(1, Ordering::SeqCst);
         }
-        self.session
-            .shared
-            .stats
-            .queue_full_error_count
-            .fetch_add(1, Ordering::SeqCst);
+
         // notify close
         let mut event = vec![0u8; 12];
         unsafe {

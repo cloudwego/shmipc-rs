@@ -89,6 +89,54 @@ async fn test_ping_pong_by_shmipc() {
     println!("elapsed: {:?}", elapsed);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fallback_data_before_stream_close() {
+    let rand = rand::random::<u64>();
+    let path = format!("/dev/shm/shmipc{}.sock", rand);
+    let size = 2 << 20;
+    let mut sm_config = benchmark_config();
+
+    sm_config.config_mut().share_memory_buffer_cap = 1 << 20;
+    sm_config.config_mut().buffer_slice_sizes = vec![SizePercentPair {
+        size: 4096,
+        percent: 100,
+    }];
+    sm_config
+        .config_mut()
+        .share_memory_path_prefix
+        .push_str(rand.to_string().as_str());
+    sm_config = sm_config.with_session_num(1);
+
+    let mut server = Listener::new(
+        DefaultUnixListen,
+        SocketAddr::from_pathname(path.clone()).unwrap(),
+        sm_config.config().clone(),
+    )
+    .await
+    .unwrap();
+
+    tokio_scoped::scope(|s| {
+        s.spawn(async move {
+            let mut stream = server.accept().await.unwrap();
+            assert!(must_read(&mut stream, size).await);
+            assert!(!must_read(&mut stream, 1).await);
+        });
+        s.spawn(async move {
+            let client = SessionManager::new(
+                sm_config,
+                DefaultUnixConnect,
+                SocketAddr::from_pathname(path).unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut stream = client.get_stream().unwrap();
+            must_write(&mut stream, size).await;
+            assert!(stream.fallback_state());
+            stream.close().await.unwrap();
+        });
+    });
+}
+
 fn benchmark_config() -> SessionManagerConfig {
     let mut c = SessionManagerConfig::new();
     c.config_mut().queue_cap = 65536;

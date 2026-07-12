@@ -121,6 +121,12 @@ impl BufferManager {
         } else {
             let f_info = nix::sys::stat::fstat(unsafe { BorrowedFd::borrow_raw(memfd) })
                 .map_err(|err| anyhow!("BufferManager get_with_memfd mapping failed: {}", err))?;
+            if f_info.st_size < 0 || f_info.st_size > u32::MAX as i64 {
+                return Err(anyhow!(
+                    "BufferManager get_with_memfd invalid share memory size: {}",
+                    f_info.st_size
+                ));
+            }
             capacity = f_info.st_size as u32;
         }
 
@@ -186,7 +192,14 @@ impl BufferManager {
             let fi = shm_file
                 .metadata()
                 .map_err(|err| anyhow!("get_global_buffer_manager mapping failed, {err}"))?;
-            capacity = fi.len() as u32;
+            let sz = fi.len();
+            if sz > u32::MAX as u64 {
+                return Err(anyhow!(
+                    "get_global_buffer_manager invalid share memory size: {}",
+                    sz
+                ));
+            }
+            capacity = sz as u32;
             shm_file
         };
 
@@ -410,6 +423,27 @@ impl BufferManager {
 
     pub fn recycle_buffer(&self, slice: BufferSlice) {
         if slice.is_from_shm {
+            let Some(buffer_header) = &slice.buffer_header else {
+                tracing::warn!(
+                    "skip recycling shm buffer without header: path={} offset={} cap={} size={}",
+                    self.path,
+                    slice.offset_in_shm,
+                    slice.cap,
+                    slice.size()
+                );
+                return;
+            };
+            if !buffer_header.is_in_used() {
+                tracing::warn!(
+                    "skip recycling shm buffer that is not in use: path={} offset={} cap={} \
+                     size={}",
+                    self.path,
+                    slice.offset_in_shm,
+                    slice.cap,
+                    slice.size()
+                );
+                return;
+            }
             for list in self.lists.iter() {
                 if slice.cap == unsafe { *list.cap_per_buffer } {
                     list.push(slice);
@@ -507,7 +541,7 @@ impl BufferManager {
     pub fn check_buffer_returned(&self) -> bool {
         for list in self.lists.iter() {
             unsafe {
-                if (*list.size).load(Ordering::SeqCst) as u32 != (*list.cap).load(Ordering::SeqCst)
+                if (*list.size).load(Ordering::SeqCst) != (*list.cap).load(Ordering::SeqCst) as i32
                 {
                     return false;
                 }
@@ -554,6 +588,9 @@ impl BufferManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    use memmap2::MmapOptions;
     use rand::Rng;
 
     use super::{BufferManager, SizePercentPair};
@@ -714,5 +751,51 @@ mod tests {
         linked_buffer_slices.done(false);
         bm.recycle_buffers(linked_buffer_slices.slice_list_mut().pop_front().unwrap());
         assert_eq!(num_of_slice, bm.slice_size());
+    }
+
+    #[test]
+    fn test_buffer_manager_skip_duplicate_recycle() {
+        let mem = MmapOptions::new().len(1 << 20).map_anon().unwrap();
+        let bm = BufferManager::create(
+            &[SizePercentPair {
+                size: 4096,
+                percent: 100,
+            }],
+            "",
+            mem,
+            0,
+        )
+        .unwrap();
+        let list = bm.lists[0];
+        let original_size = unsafe { (*list.size).load(Ordering::SeqCst) };
+        let original_counter = unsafe { (*list.counter).load(Ordering::SeqCst) };
+
+        let slice = bm.alloc_shm_buffer(4096).unwrap();
+        let offset = slice.offset_in_shm;
+        let alias = bm.read_buffer_slice(offset).unwrap();
+
+        assert_eq!(original_size - 1, unsafe {
+            (*list.size).load(Ordering::SeqCst)
+        });
+        assert_eq!(original_counter + 1, unsafe {
+            (*list.counter).load(Ordering::SeqCst)
+        });
+
+        bm.recycle_buffer(slice);
+        assert_eq!(original_size, unsafe {
+            (*list.size).load(Ordering::SeqCst)
+        });
+        assert_eq!(original_counter, unsafe {
+            (*list.counter).load(Ordering::SeqCst)
+        });
+
+        bm.recycle_buffer(alias);
+        assert_eq!(original_size, unsafe {
+            (*list.size).load(Ordering::SeqCst)
+        });
+        assert_eq!(original_counter, unsafe {
+            (*list.counter).load(Ordering::SeqCst)
+        });
+        assert!(bm.check_buffer_returned());
     }
 }
