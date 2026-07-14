@@ -43,6 +43,7 @@ enum ReadState {
     Idle,
     Reading(BoxFuture<'static, Result<Buf<'static>, Error>>),
     Consuming(crate::util::shmbuf_reader::BufReader),
+    Eof,
 }
 
 enum WriteState {
@@ -83,6 +84,11 @@ impl AsyncRead for StreamExt {
                             this.read_state =
                                 ReadState::Consuming(crate::util::shmbuf_reader::BufReader::new(b));
                         }
+                        Err(Error::EndOfStream) => {
+                            // AsyncRead represents EOF by successfully reading zero bytes.
+                            this.read_state = ReadState::Eof;
+                            return Poll::Ready(Ok(()));
+                        }
                         Err(e) => {
                             this.read_state = ReadState::Idle;
                             return Poll::Ready(Err(e.into()));
@@ -95,6 +101,7 @@ impl AsyncRead for StreamExt {
                     }
                     return Poll::Ready(Ok(()));
                 }
+                ReadState::Eof => return Poll::Ready(Ok(())),
             }
         }
     }

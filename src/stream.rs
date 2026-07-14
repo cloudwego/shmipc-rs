@@ -17,7 +17,7 @@ use std::{
     ptr::copy_nonoverlapping,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,8 +37,33 @@ pub const STREAM_OPENED: u32 = 0;
 pub const STREAM_CLOSED: u32 = 1;
 pub const STREAM_HALF_CLOSED: u32 = 2;
 
+const QUEUE_FULL_RETRY_COUNT: usize = 10;
+const QUEUE_FULL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+async fn retry_queue_put<F>(close_notify: &Notify, mut put: F) -> Result<(), Error>
+where
+    F: FnMut() -> Result<(), Error>,
+{
+    for _ in 0..QUEUE_FULL_RETRY_COUNT {
+        if tokio::time::timeout(QUEUE_FULL_RETRY_INTERVAL, close_notify.notified())
+            .await
+            .is_ok()
+        {
+            return Err(Error::StreamClosed);
+        }
+
+        match put() {
+            Ok(()) => return Ok(()),
+            Err(Error::QueueFull) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(Error::QueueFull)
+}
+
 /// Stream is used to represent a logical stream within a session
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Stream {
     inner: Arc<StreamInner>,
     id: u32,
@@ -56,6 +81,7 @@ pub struct StreamInner {
     recv_notify: Notify,
     // if in_fallback_state is set to true, sending should use uds
     in_fallback_state: AtomicBool,
+    handle_count: AtomicUsize,
 }
 
 unsafe impl Sync for StreamInner {}
@@ -76,6 +102,7 @@ impl Stream {
                 close_notify,
                 recv_notify,
                 in_fallback_state: AtomicBool::new(false),
+                handle_count: AtomicUsize::new(1),
             }),
             session,
         }
@@ -95,6 +122,18 @@ impl Stream {
 
     pub const fn stream_id(&self) -> u32 {
         self.id
+    }
+}
+
+impl Clone for Stream {
+    fn clone(&self) -> Self {
+        self.inner.handle_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+            id: self.id,
+            session: self.session.clone(),
+            session_id: self.session_id,
+        }
     }
 }
 
@@ -152,8 +191,8 @@ impl Stream {
             return;
         }
         let pre_len = buf.len();
-        for data in pending_data.drain(0..) {
-            if let Some(fallback_slice) = data.fallback_slice {
+        for mut data in pending_data.drain(0..) {
+            if let Some(fallback_slice) = data.fallback_slice.take() {
                 buf.append_buffer_slice(fallback_slice);
                 self.inner.in_fallback_state.store(true, Ordering::SeqCst);
                 continue;
@@ -260,6 +299,10 @@ impl Stream {
     fn clean(&self) {
         self.session
             .on_stream_close(self.id, self.inner.state.load(Ordering::SeqCst));
+        self.clean_local_buffers();
+    }
+
+    fn clean_local_buffers(&self) {
         self.clean_pending_data();
         self.recv_buf().recycle();
         self.send_buf().recycle();
@@ -267,8 +310,8 @@ impl Stream {
 
     fn clean_pending_data(&self) {
         let mut pending_data = self.inner.pending_data.lock().unwrap();
-        for data in pending_data.drain(0..) {
-            if let Some(fallback_slice) = data.fallback_slice {
+        for mut data in pending_data.drain(0..) {
+            if let Some(fallback_slice) = data.fallback_slice.take() {
                 if !fallback_slice.is_from_shm {
                     unsafe {
                         _ = Vec::from_raw_parts(
@@ -438,8 +481,9 @@ impl Stream {
     ///
     /// To specify a length of buffer, refer to [`Stream::read_bytes`].
     ///
-    /// NOTE: after using the buffer, you MUST explicitly call `stream.release_read_and_reuse()`
-    /// for releasing it, otherwise it will cause memory leak.
+    /// Call [`Stream::release_read_and_reuse`] after processing a response to make consumed
+    /// storage available for stream reuse immediately. Any outstanding zero-copy buffer keeps
+    /// only its own slice pinned until it is dropped.
     pub async fn read(&mut self) -> Result<Buf<'_>, Error> {
         let buf = self.recv_buf();
         if buf.is_empty() {
@@ -548,41 +592,43 @@ impl Stream {
             .stats
             .queue_full_error_count
             .fetch_add(1, Ordering::SeqCst);
-        for _ in 0..10 {
-            if tokio::time::timeout(
-                Duration::from_millis(10),
-                self.inner.close_notify.notified(),
-            )
-            .await
-            .is_ok()
-            {
-                send_buf.recycle();
-                return Err(Error::StreamClosed);
-            }
-
-            match self
-                .session
+        let root_buf_offset = send_buf.root_buf_offset();
+        match retry_queue_put(&self.inner.close_notify, || {
+            self.session
                 .shared
                 .queue_manager
                 .send_queue
                 .put(QueueElement {
                     seq_id: self.id,
-                    offset_in_shm_buf: send_buf.root_buf_offset(),
+                    offset_in_shm_buf: root_buf_offset,
                     status: state,
-                }) {
-                Ok(_) => {
-                    let ret = self.session.wake_up_peer().await;
-                    send_buf.clean();
-                    return ret;
-                }
-                Err(Error::QueueFull) => continue,
-                Err(err) => {
-                    send_buf.recycle();
-                    return Err(err);
-                }
+                })
+        })
+        .await
+        {
+            Ok(()) => {
+                let ret = self.session.wake_up_peer().await;
+                send_buf.clean();
+                ret
+            }
+            // The queue never took ownership, so retain the buffer for a caller retry.
+            Err(Error::QueueFull) => Err(Error::QueueFull),
+            Err(err) => {
+                send_buf.recycle();
+                Err(err)
             }
         }
-        Ok(())
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // `LinkedBuffer` and fallback slices own raw allocations and therefore cannot clean
+        // themselves up. A peer close removes the stream from the session map without calling
+        // `clean`, so release any unread data when the final stream handle goes away.
+        if self.inner.handle_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.clean_local_buffers();
+        }
     }
 }
 
@@ -590,4 +636,49 @@ impl Stream {
 pub struct BufferSliceWrapper {
     pub(crate) fallback_slice: Option<BufferSlice>,
     pub(crate) offset: u32,
+}
+
+impl Drop for BufferSliceWrapper {
+    fn drop(&mut self) {
+        let Some(fallback_slice) = self.fallback_slice.take() else {
+            return;
+        };
+        if fallback_slice.is_from_shm {
+            tracing::warn!(
+                "fallback slice is from shm, offset:{}",
+                fallback_slice.offset_in_shm
+            );
+            return;
+        }
+        unsafe {
+            _ = Vec::from_raw_parts(
+                fallback_slice.data,
+                fallback_slice.cap as usize,
+                fallback_slice.cap as usize,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_queue_put_reports_persistent_queue_full() {
+        let close_notify = Notify::new();
+        let attempts = AtomicUsize::new(0);
+
+        let err = retry_queue_put(&close_notify, || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(Error::QueueFull)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, Error::QueueFull));
+        assert_eq!(attempts.load(Ordering::Relaxed), QUEUE_FULL_RETRY_COUNT);
+    }
 }

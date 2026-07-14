@@ -230,7 +230,7 @@ impl BufferList {
 
     /// Push a buffer to the list.
     pub fn push(&self, mut buffer: BufferSlice) {
-        buffer.reset();
+        buffer.reset_for_recycle();
         loop {
             let old_tail = unsafe { (*self.tail).load(Ordering::SeqCst) };
             let new_tail = buffer.offset_in_shm - self.buffer_region_offset_in_shm;

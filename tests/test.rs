@@ -27,13 +27,14 @@ use std::{
 use shmipc::{
     Error, Listener,
     buffer::{BufferReader, BufferSlice, LinkedBuffer},
+    compact::StreamExt,
     config::SizePercentPair,
     consts::MemMapType,
     session::{SessionManager, SessionManagerConfig},
     stream::Stream,
     transport::{DefaultUnixConnect, DefaultUnixListen, TransportConnect},
 };
-use tokio::net::UnixStream;
+use tokio::{io::AsyncReadExt, net::UnixStream};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ping_pong_by_shmipc() {
@@ -125,9 +126,14 @@ async fn test_fallback_data_before_stream_close() {
 
     tokio_scoped::scope(|s| {
         s.spawn(async move {
-            let mut stream = server.accept().await.unwrap();
-            assert!(must_read(&mut stream, size).await);
-            assert!(!must_read(&mut stream, 1).await);
+            let stream = server.accept().await.unwrap();
+            let mut stream = StreamExt::new(stream);
+            let mut data = vec![0; size as usize];
+            stream.read_exact(&mut data).await.unwrap();
+
+            let mut trailing = [0; 1];
+            assert_eq!(stream.read(&mut trailing).await.unwrap(), 0);
+            assert_eq!(stream.read(&mut trailing).await.unwrap(), 0);
         });
         s.spawn(async move {
             let client = SessionManager::new(

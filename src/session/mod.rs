@@ -918,8 +918,6 @@ impl Session {
             return (0, event_len, true, None);
         }
         assert!(payload_len >= fallback_data_header);
-        let mut data = vec![0u8; payload_len - fallback_data_header];
-        data.copy_from_slice(&buf[fallback_data_header..payload_len]);
         // fallback data layout: eventHeader | seqID | status | payload
         let seq_id = u32::from_be_bytes(buf[..4].try_into().unwrap());
         // now the first byte of status is streamState, and the other byte of status is undefined.
@@ -932,28 +930,29 @@ impl Session {
             status
         );
         self.open_circuit_breaker().await;
-        let mut fallback_slice = BufferSlice::new(None, &mut data, 0, false);
-        fallback_slice.write_index = data.len();
-        std::mem::forget(data);
         self.shared
             .stats
             .fallback_read_count
             .fetch_add(1, Ordering::SeqCst);
         match self.get_stream(seq_id, status).await {
-            Some(stream) => (
-                event_len,
-                HEADER_SIZE,
-                false,
-                self.handle_stream_message(
-                    stream,
-                    BufferSliceWrapper {
-                        fallback_slice: Some(fallback_slice),
-                        offset: 0,
-                    },
-                    status,
+            Some(stream) => {
+                let mut data = vec![0u8; payload_len - fallback_data_header];
+                data.copy_from_slice(&buf[fallback_data_header..payload_len]);
+                let mut fallback_slice = BufferSlice::new(None, &mut data, 0, false);
+                fallback_slice.write_index = data.len();
+                let wrapper = BufferSliceWrapper {
+                    fallback_slice: Some(fallback_slice),
+                    offset: 0,
+                };
+                // The wrapper now owns the allocation through the raw pointer in its slice.
+                std::mem::forget(data);
+                (
+                    event_len,
+                    HEADER_SIZE,
+                    false,
+                    self.handle_stream_message(stream, wrapper, status).err(),
                 )
-                .err(),
-            ),
+            }
             None => (event_len, HEADER_SIZE, false, None),
         }
     }

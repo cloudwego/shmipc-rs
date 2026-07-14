@@ -23,7 +23,9 @@ use crate::consts::{
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SizePercentPair {
+    #[serde(alias = "Size")]
     pub size: u32,
+    #[serde(alias = "Percent")]
     pub percent: u32,
 }
 
@@ -276,6 +278,22 @@ mod tests {
     use std::time::Duration;
 
     use super::{Config, ProtocolMode, SizePercentPair, WakeupMode};
+
+    #[test]
+    fn size_percent_pair_accepts_lowercase_and_pascal_case_fields() {
+        let pairs: Vec<SizePercentPair> = serde_json::from_str(
+            r#"[
+                {"size": 16384, "percent": 40},
+                {"Size": 32768, "Percent": 60}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(pairs[0].size, 16384);
+        assert_eq!(pairs[0].percent, 40);
+        assert_eq!(pairs[1].size, 32768);
+        assert_eq!(pairs[1].percent, 60);
+    }
 
     #[test]
     fn verify_aligns_buffer_slice_sizes_and_queue_cap() {

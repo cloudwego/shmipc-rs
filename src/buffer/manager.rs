@@ -389,13 +389,16 @@ impl BufferManager {
         result
     }
 
-    // alloc single buffer slice , whose performance better than alloc_shm_buffers.
+    // Allocate a single buffer slice from the smallest available size class that fits.
     pub fn alloc_shm_buffer(&self, size: u32) -> Result<BufferSlice, Error> {
         if size <= self.max_slice_size {
             for list in self.lists.iter() {
                 if size <= unsafe { *list.cap_per_buffer } {
-                    let buf = list.pop()?;
-                    return Ok(buf);
+                    match list.pop() {
+                        Ok(buf) => return Ok(buf),
+                        Err(Error::NoMoreBuffer) => continue,
+                        Err(err) => return Err(err),
+                    }
                 }
             }
         }
@@ -423,7 +426,7 @@ impl BufferManager {
 
     pub fn recycle_buffer(&self, slice: BufferSlice) {
         if slice.is_from_shm {
-            let Some(buffer_header) = &slice.buffer_header else {
+            if slice.buffer_header.is_none() {
                 tracing::warn!(
                     "skip recycling shm buffer without header: path={} offset={} cap={} size={}",
                     self.path,
@@ -432,18 +435,11 @@ impl BufferManager {
                     slice.size()
                 );
                 return;
-            };
-            if !buffer_header.is_in_used() {
-                tracing::warn!(
-                    "skip recycling shm buffer that is not in use: path={} offset={} cap={} \
-                     size={}",
-                    self.path,
-                    slice.offset_in_shm,
-                    slice.cap,
-                    slice.size()
-                );
-                return;
             }
+            // Legacy peers such as shmipc_cpp do not set SLICE_IN_USED_FLAG when allocating a
+            // buffer. Rejecting those buffers here permanently removes them from the shared
+            // free-list, so recycle them based on their capacity until ownership capability is
+            // negotiated across implementations.
             for list in self.lists.iter() {
                 if slice.cap == unsafe { *list.cap_per_buffer } {
                     list.push(slice);
@@ -753,7 +749,48 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_manager_skip_duplicate_recycle() {
+    fn test_alloc_shm_buffer_tries_larger_size_classes() {
+        let mem = MmapOptions::new().len(1 << 20).map_anon().unwrap();
+        let bm = BufferManager::create(
+            &[
+                SizePercentPair {
+                    size: 1024,
+                    percent: 34,
+                },
+                SizePercentPair {
+                    size: 4096,
+                    percent: 33,
+                },
+                SizePercentPair {
+                    size: 16 * 1024,
+                    percent: 33,
+                },
+            ],
+            "",
+            mem,
+            0,
+        )
+        .unwrap();
+
+        let mut allocated = Vec::new();
+        for list in &bm.lists[..2] {
+            while let Ok(slice) = list.pop() {
+                allocated.push(slice);
+            }
+        }
+
+        let slice = bm.alloc_shm_buffer(1024).unwrap();
+        assert_eq!(16 * 1024, slice.capacity());
+
+        bm.recycle_buffer(slice);
+        for slice in allocated {
+            bm.recycle_buffer(slice);
+        }
+        assert!(bm.check_buffer_returned());
+    }
+
+    #[test]
+    fn test_buffer_manager_recycle_legacy_slice_without_in_used_flag() {
         let mem = MmapOptions::new().len(1 << 20).map_anon().unwrap();
         let bm = BufferManager::create(
             &[SizePercentPair {
@@ -770,8 +807,7 @@ mod tests {
         let original_counter = unsafe { (*list.counter).load(Ordering::SeqCst) };
 
         let slice = bm.alloc_shm_buffer(4096).unwrap();
-        let offset = slice.offset_in_shm;
-        let alias = bm.read_buffer_slice(offset).unwrap();
+        slice.buffer_header.as_ref().unwrap().clear_flag();
 
         assert_eq!(original_size - 1, unsafe {
             (*list.size).load(Ordering::SeqCst)
@@ -788,13 +824,6 @@ mod tests {
             (*list.counter).load(Ordering::SeqCst)
         });
 
-        bm.recycle_buffer(alias);
-        assert_eq!(original_size, unsafe {
-            (*list.size).load(Ordering::SeqCst)
-        });
-        assert_eq!(original_counter, unsafe {
-            (*list.counter).load(Ordering::SeqCst)
-        });
         assert!(bm.check_buffer_returned());
     }
 }
