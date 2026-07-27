@@ -20,6 +20,7 @@ use std::{
 use shmipc::{
     Error, Listener,
     buffer::{BufferReader, BufferSlice, LinkedBuffer},
+    compact::StreamExt,
     config::{Config, SizePercentPair},
     consts::MemMapType,
     session::{SessionManager, SessionManagerConfig},
@@ -27,11 +28,27 @@ use shmipc::{
     stream::Stream,
     transport::{DefaultUnixConnect, DefaultUnixListen},
 };
+use tokio::io::AsyncReadExt;
 
 const DEFAULT_ITERS: usize = 5_000;
 const DEFAULT_WARMUP_ITERS: usize = 500;
 const DEFAULT_PAYLOAD_BYTES: u32 = 64;
 const POLLING_INTERVAL: Duration = Duration::from_micros(100);
+
+#[derive(Clone, Copy)]
+enum ReadPath {
+    Discard,
+    StreamExt,
+}
+
+impl ReadPath {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Discard => "discard",
+            Self::StreamExt => "stream-ext",
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct BenchMode {
@@ -55,6 +72,8 @@ fn main() {
     let iters = env_usize("SHMIPC_PERF_ITERS", DEFAULT_ITERS);
     let warmup_iters = env_usize("SHMIPC_PERF_WARMUP_ITERS", DEFAULT_WARMUP_ITERS);
     let payload_bytes = env_u32("SHMIPC_PERF_PAYLOAD_BYTES", DEFAULT_PAYLOAD_BYTES);
+    let read_path = env_read_path("SHMIPC_PERF_READ_PATH");
+    let slice_bytes = env_optional_u32("SHMIPC_PERF_SLICE_BYTES");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -89,10 +108,17 @@ fn main() {
 
     let mut results = Vec::with_capacity(modes.len());
     for mode in modes {
-        results.push(runtime.block_on(run_mode(mode, iters, warmup_iters, payload_bytes)));
+        results.push(runtime.block_on(run_mode(
+            mode,
+            iters,
+            warmup_iters,
+            payload_bytes,
+            read_path,
+            slice_bytes,
+        )));
     }
 
-    print_results(&results, warmup_iters);
+    print_results(&results, warmup_iters, read_path, slice_bytes);
 }
 
 async fn run_mode(
@@ -100,10 +126,16 @@ async fn run_mode(
     iters: usize,
     warmup_iters: usize,
     payload_bytes: u32,
+    read_path: ReadPath,
+    slice_bytes: Option<u32>,
 ) -> BenchResult {
     let rand = rand::random::<u64>();
     let socket_path = format!("/dev/shm/shmipc-perf-{}-{rand}.sock", mode.name);
-    let mut sm_config = benchmark_config((mode.configure)(Config::default()), payload_bytes);
+    let mut sm_config = benchmark_config(
+        (mode.configure)(Config::default()),
+        payload_bytes,
+        slice_bytes,
+    );
     sm_config
         .config_mut()
         .share_memory_path_prefix
@@ -119,10 +151,10 @@ async fn run_mode(
     .unwrap();
 
     let server_task = tokio::spawn(async move {
-        let mut stream = server.accept().await.unwrap();
-        while must_read(&mut stream, payload_bytes).await {
-            stream.recv_buf().release_previous_read();
-            must_write(&mut stream, payload_bytes).await;
+        let stream = server.accept().await.unwrap();
+        match read_path {
+            ReadPath::Discard => serve_discard(stream, payload_bytes).await,
+            ReadPath::StreamExt => serve_stream_ext(stream, payload_bytes).await,
         }
         server.close().await;
     });
@@ -134,10 +166,10 @@ async fn run_mode(
     )
     .await
     .unwrap();
-    let mut stream = client.get_stream().unwrap();
+    let mut stream = BenchClient::new(client.get_stream().unwrap(), read_path, payload_bytes);
 
     for _ in 0..warmup_iters {
-        round_trip(&mut stream, payload_bytes).await;
+        stream.round_trip(payload_bytes).await;
     }
 
     let stats_before = client.stats_snapshot();
@@ -146,14 +178,14 @@ async fn run_mode(
     let mut latencies = Vec::with_capacity(iters);
     for _ in 0..iters {
         let op_start = Instant::now();
-        round_trip(&mut stream, payload_bytes).await;
+        stream.round_trip(payload_bytes).await;
         latencies.push(op_start.elapsed());
     }
     let wall = wall_start.elapsed();
     let cpu = process_cpu_time().saturating_sub(cpu_before);
     let stats = client.stats_snapshot().saturating_sub(stats_before);
 
-    stream.close().await.unwrap();
+    stream.close().await;
     drop(stream);
     client.close().await;
     server_task.await.unwrap();
@@ -172,19 +204,77 @@ async fn run_mode(
     }
 }
 
-async fn round_trip(stream: &mut Stream, payload_bytes: u32) {
-    must_write(stream, payload_bytes).await;
-    assert!(must_read(stream, payload_bytes).await);
-    stream.release_read_and_reuse();
+enum BenchClient {
+    Discard(Stream),
+    StreamExt {
+        stream: StreamExt,
+        read_buf: Vec<u8>,
+    },
 }
 
-fn benchmark_config(config: Config, payload_bytes: u32) -> SessionManagerConfig {
-    let mut c = SessionManagerConfig::new().with_config(Config {
-        mem_map_type: MemMapType::MemMapTypeMemFd,
-        queue_cap: 65536,
-        connection_write_timeout: Duration::from_secs(1),
-        share_memory_buffer_cap: 256 << 20,
-        buffer_slice_sizes: vec![
+impl BenchClient {
+    fn new(stream: Stream, read_path: ReadPath, payload_bytes: u32) -> Self {
+        match read_path {
+            ReadPath::Discard => Self::Discard(stream),
+            ReadPath::StreamExt => Self::StreamExt {
+                stream: StreamExt::new(stream),
+                read_buf: vec![0; payload_bytes as usize],
+            },
+        }
+    }
+
+    async fn round_trip(&mut self, payload_bytes: u32) {
+        match self {
+            Self::Discard(stream) => {
+                must_write(stream, payload_bytes).await;
+                assert!(must_read(stream, payload_bytes).await);
+                stream.release_read_and_reuse();
+            }
+            Self::StreamExt { stream, read_buf } => {
+                must_write(stream.inner_mut(), payload_bytes).await;
+                assert!(must_read_stream_ext(stream, read_buf).await);
+                stream.inner().release_read_and_reuse();
+            }
+        }
+    }
+
+    async fn close(&mut self) {
+        match self {
+            Self::Discard(stream) => stream.close().await.unwrap(),
+            Self::StreamExt { stream, .. } => stream.inner_mut().close().await.unwrap(),
+        }
+    }
+}
+
+async fn serve_discard(mut stream: Stream, payload_bytes: u32) {
+    while must_read(&mut stream, payload_bytes).await {
+        stream.recv_buf().release_previous_read();
+        must_write(&mut stream, payload_bytes).await;
+    }
+}
+
+async fn serve_stream_ext(stream: Stream, payload_bytes: u32) {
+    let mut stream = StreamExt::new(stream);
+    let mut read_buf = vec![0; payload_bytes as usize];
+    while must_read_stream_ext(&mut stream, &mut read_buf).await {
+        stream.inner().recv_buf().release_previous_read();
+        must_write(stream.inner_mut(), payload_bytes).await;
+    }
+}
+
+fn benchmark_config(
+    config: Config,
+    payload_bytes: u32,
+    slice_bytes: Option<u32>,
+) -> SessionManagerConfig {
+    let buffer_slice_sizes = match slice_bytes {
+        Some(size) => vec![SizePercentPair {
+            size: size
+                .checked_add(256)
+                .expect("SHMIPC_PERF_SLICE_BYTES is too large"),
+            percent: 100,
+        }],
+        None => vec![
             SizePercentPair {
                 size: payload_bytes + 256,
                 percent: 70,
@@ -198,6 +288,13 @@ fn benchmark_config(config: Config, payload_bytes: u32) -> SessionManagerConfig 
                 percent: 10,
             },
         ],
+    };
+    let mut c = SessionManagerConfig::new().with_config(Config {
+        mem_map_type: MemMapType::MemMapTypeMemFd,
+        queue_cap: 65536,
+        connection_write_timeout: Duration::from_secs(1),
+        share_memory_buffer_cap: 256 << 20,
+        buffer_slice_sizes,
         ..config
     });
     c.config_mut().verify().unwrap();
@@ -260,6 +357,14 @@ async fn must_read(s: &mut Stream, size: u32) -> bool {
     }
 }
 
+async fn must_read_stream_ext(stream: &mut StreamExt, buf: &mut [u8]) -> bool {
+    match stream.read_exact(buf).await {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(err) => panic!("must read err:{err}"),
+    }
+}
+
 fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
@@ -280,6 +385,27 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_optional_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be a positive u32"))
+        })
+        .inspect(|&value| {
+            assert!(value > 0, "{name} must be greater than zero");
+        })
+}
+
+fn env_read_path(name: &str) -> ReadPath {
+    match std::env::var(name).as_deref() {
+        Ok("stream-ext") => ReadPath::StreamExt,
+        Ok("discard") | Err(_) => ReadPath::Discard,
+        Ok(value) => panic!("{name} must be either discard or stream-ext, got {value}"),
+    }
 }
 
 fn env_modes(name: &str) -> Option<Vec<String>> {
@@ -307,12 +433,23 @@ fn timeval_to_duration(time: libc::timeval) -> Duration {
     Duration::from_secs(time.tv_sec as u64) + Duration::from_micros(time.tv_usec as u64)
 }
 
-fn print_results(results: &[BenchResult], warmup_iters: usize) {
+fn print_results(
+    results: &[BenchResult],
+    warmup_iters: usize,
+    read_path: ReadPath,
+    slice_bytes: Option<u32>,
+) {
     println!("# shmipc V4 protocol matrix benchmark");
     println!();
     println!(
-        "warmup_iters={} measured_iters={} payload_bytes={}",
-        warmup_iters, results[0].iters, results[0].payload_bytes
+        "warmup_iters={} measured_iters={} payload_bytes={} read_path={} slice_bytes={}",
+        warmup_iters,
+        results[0].iters,
+        results[0].payload_bytes,
+        read_path.name(),
+        slice_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_owned())
     );
     println!();
     println!(

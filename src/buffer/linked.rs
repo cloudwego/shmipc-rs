@@ -18,6 +18,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use tokio::io::ReadBuf;
 
 use super::{
     BufferReader, BufferWriter,
@@ -359,6 +360,60 @@ impl LinkedBuffer {
             self.pin_registry.retire(slice);
         }
     }
+
+    pub(crate) fn read_available_into(
+        &mut self,
+        dst: &mut ReadBuf<'_>,
+        max_slices: usize,
+    ) -> Result<usize, Error> {
+        if dst.remaining() == 0 {
+            return Ok(0);
+        }
+        assert!(max_slices > 0, "max_slices must be greater than zero");
+
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
+        if self.len == 0 {
+            return Err(Error::NotEnoughData);
+        }
+
+        while self.len > 0
+            && self
+                .slice_list
+                .front()
+                .is_some_and(|slice| slice.size() == 0)
+        {
+            self.read_next_slice();
+        }
+
+        let mut copied = 0;
+        let mut slices_read = 0;
+        while self.len > 0 && dst.remaining() > 0 && slices_read < max_slices {
+            let available = self
+                .slice_list
+                .front()
+                .map(BufferSlice::size)
+                .filter(|size| *size > 0)
+                .ok_or(Error::NotEnoughData)?;
+            let read_size = available.min(dst.remaining());
+            let data = self.slice_list.front_mut().unwrap().read(read_size);
+            dst.put_slice(data);
+            self.len -= read_size;
+            copied += read_size;
+
+            if read_size == available {
+                slices_read += 1;
+                if self.len > 0 {
+                    self.read_next_slice();
+                }
+            } else {
+                break;
+            }
+        }
+
+        debug_assert!(copied > 0);
+        Ok(copied)
+    }
 }
 
 impl BufferReader for LinkedBuffer {
@@ -586,10 +641,11 @@ impl BufferWriter for LinkedBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{ptr::NonNull, sync::Arc};
 
     use memmap2::MmapOptions;
     use rand::Rng;
+    use tokio::io::ReadBuf;
 
     use super::{BufferReader, LinkedBuffer};
     use crate::{
@@ -634,6 +690,28 @@ mod tests {
         l.slice_list.push_back(slice);
         l.slice_list.write_slice = l.slice_list.back_slice;
         l
+    }
+
+    fn fallback_slice(data: &[u8]) -> BufferSlice {
+        let mut owned = Vec::with_capacity(data.len());
+        owned.extend_from_slice(data);
+        let slice = BufferSlice {
+            buffer_header: None,
+            data: owned.as_mut_ptr(),
+            cap: owned.capacity() as u32,
+            start: 0,
+            offset_in_shm: 0,
+            read_index: 0,
+            write_index: owned.len(),
+            is_from_shm: false,
+            next_slice: None::<NonNull<BufferSlice>>,
+        };
+        std::mem::forget(owned);
+        slice
+    }
+
+    fn append_fallback(buffer: &mut LinkedBuffer, data: &[u8]) {
+        buffer.append_buffer_slice(fallback_slice(data));
     }
 
     #[test]
@@ -879,6 +957,103 @@ mod tests {
         buffer.write_bytes(&rewritten).unwrap();
         let chunk = buffer.read_chunk().unwrap();
         assert_eq!(&chunk[..], rewritten);
+    }
+
+    #[test]
+    fn read_available_into_copies_across_slices_without_leases() {
+        let manager = Arc::new(init_shm());
+        let mut buffer = LinkedBuffer::new(manager);
+        append_fallback(&mut buffer, b"ab");
+        append_fallback(&mut buffer, b"cde");
+        append_fallback(&mut buffer, b"fghi");
+
+        let mut first = [0; 4];
+        let mut dst = ReadBuf::new(&mut first);
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 4);
+        assert_eq!(dst.filled(), b"abcd");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer.slice_list.size(), 2);
+        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+
+        let mut second = [0; 8];
+        let mut dst = ReadBuf::new(&mut second);
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 5);
+        assert_eq!(dst.filled(), b"efghi");
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.slice_list.size(), 1);
+        assert_eq!(buffer.slice_list.front().unwrap().size(), 0);
+        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+
+        buffer.clean();
+    }
+
+    #[test]
+    fn read_available_into_limits_slices_per_call() {
+        let manager = Arc::new(init_shm());
+        let mut buffer = LinkedBuffer::new(manager);
+        for value in 0..65u8 {
+            append_fallback(&mut buffer, &[value]);
+        }
+
+        let mut output = [0; 65];
+        let mut dst = ReadBuf::new(&mut output);
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 64);
+        assert_eq!(dst.filled(), &(0..64u8).collect::<Vec<_>>());
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.slice_list.size(), 1);
+
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 1);
+        assert_eq!(dst.filled(), &(0..65u8).collect::<Vec<_>>());
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.slice_list.size(), 1);
+
+        buffer.clean();
+    }
+
+    #[test]
+    fn read_available_into_handles_empty_destination_and_buffer() {
+        let manager = Arc::new(init_shm());
+        let mut buffer = LinkedBuffer::new(manager);
+
+        let mut empty = [];
+        let mut empty_dst = ReadBuf::new(&mut empty);
+        assert_eq!(buffer.read_available_into(&mut empty_dst, 64).unwrap(), 0);
+
+        let mut output = [0; 1];
+        let mut dst = ReadBuf::new(&mut output);
+        assert!(matches!(
+            buffer.read_available_into(&mut dst, 64),
+            Err(Error::NotEnoughData)
+        ));
+    }
+
+    #[test]
+    fn read_available_into_preserves_last_shm_slice_for_reuse() {
+        let manager = Arc::new(init_shm());
+        let slice = manager.alloc_shm_buffer(1024).unwrap();
+        let mut buffer = new_linked_buffer_with_slice(manager, slice);
+        let data = vec![7u8; 256];
+        buffer.write_bytes(&data).unwrap();
+        buffer.done(false);
+
+        let mut output = vec![0; data.len()];
+        let mut dst = ReadBuf::new(&mut output);
+        assert_eq!(
+            buffer.read_available_into(&mut dst, 64).unwrap(),
+            data.len()
+        );
+        assert_eq!(dst.filled(), data);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.slice_list.size(), 1);
+        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+
+        buffer.release_previous_read_and_reserve();
+        assert_eq!(buffer.slice_list.size(), 1);
+        assert!(buffer.slice_list.write_slice.is_some());
+        assert_eq!(buffer.slice_list.front().unwrap().read_index, 0);
+        assert_eq!(buffer.slice_list.front().unwrap().write_index, 0);
+
+        buffer.clean();
     }
 
     #[test]

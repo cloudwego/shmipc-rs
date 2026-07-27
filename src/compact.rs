@@ -5,7 +5,9 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{buffer::Buf, error::Error, stream::Stream};
+use crate::{error::Error, stream::Stream};
+
+const MAX_READ_SLICES_PER_POLL: usize = 64;
 
 /// [`Stream`] compatible with [`AsyncRead`] and [`AsyncWrite`].
 pub struct StreamExt {
@@ -44,9 +46,8 @@ enum ReadState {
     Idle(Stream),
     Reading {
         tracked_stream: Stream,
-        future: BoxFuture<'static, (Stream, Result<bytes::Bytes, Error>)>,
+        future: BoxFuture<'static, (Stream, Result<(), Error>)>,
     },
-    Consuming(Stream, crate::util::shmbuf_reader::BufReader),
     Eof(Stream),
     Transitioning,
 }
@@ -55,7 +56,6 @@ impl ReadState {
     fn belongs_to(&self, inner: &Stream) -> bool {
         match self {
             Self::Idle(stream)
-            | Self::Consuming(stream, _)
             | Self::Eof(stream)
             | Self::Reading {
                 tracked_stream: stream,
@@ -91,7 +91,7 @@ impl AsyncRead for StreamExt {
                 ReadState::Idle(mut stream) => {
                     let tracked_stream = stream.clone();
                     let fut = Box::pin(async move {
-                        let result = stream.read_chunk().await.map(Buf::into_bytes);
+                        let result = stream.wait_readable().await;
                         (stream, result)
                     });
                     this.read_state = ReadState::Reading {
@@ -103,7 +103,7 @@ impl AsyncRead for StreamExt {
                     tracked_stream,
                     mut future,
                 } => {
-                    let (stream, res) = match future.as_mut().poll(cx) {
+                    let (mut stream, res) = match future.as_mut().poll(cx) {
                         Poll::Pending => {
                             this.read_state = ReadState::Reading {
                                 tracked_stream,
@@ -114,11 +114,27 @@ impl AsyncRead for StreamExt {
                         Poll::Ready(res) => res,
                     };
                     match res {
-                        Ok(b) => {
-                            this.read_state = ReadState::Consuming(
-                                stream,
-                                crate::util::shmbuf_reader::BufReader::new(b),
-                            );
+                        Ok(()) => {
+                            match stream.read_available_into(buf, MAX_READ_SLICES_PER_POLL) {
+                                Ok(read) => {
+                                    debug_assert!(read > 0);
+                                    this.read_state = ReadState::Idle(stream);
+                                    return Poll::Ready(Ok(()));
+                                }
+                                Err(Error::NotEnoughData) => {
+                                    // Another handle may have consumed the data after the wait
+                                    // completed. Wait again instead of exposing a spurious EOF.
+                                    this.read_state = ReadState::Idle(stream);
+                                }
+                                Err(Error::EndOfStream) => {
+                                    this.read_state = ReadState::Eof(stream);
+                                    return Poll::Ready(Ok(()));
+                                }
+                                Err(e) => {
+                                    this.read_state = ReadState::Idle(stream);
+                                    return Poll::Ready(Err(e.into()));
+                                }
+                            }
                         }
                         Err(Error::EndOfStream) => {
                             // AsyncRead represents EOF by successfully reading zero bytes.
@@ -130,14 +146,6 @@ impl AsyncRead for StreamExt {
                             return Poll::Ready(Err(e.into()));
                         }
                     }
-                }
-                ReadState::Consuming(stream, mut reader) => {
-                    if reader.read(buf) {
-                        this.read_state = ReadState::Idle(stream);
-                    } else {
-                        this.read_state = ReadState::Consuming(stream, reader);
-                    }
-                    return Poll::Ready(Ok(()));
                 }
                 ReadState::Eof(stream) => {
                     this.read_state = ReadState::Eof(stream);

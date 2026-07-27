@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::Notify;
+use tokio::{io::ReadBuf, sync::Notify};
 
 use crate::{
     buffer::{Buf, BufferReader, BufferWriter, linked::LinkedBuffer, slice::BufferSlice},
@@ -489,6 +489,30 @@ impl Stream {
             self.read_more(1, buf).await?;
         }
         buf.read_chunk()
+    }
+
+    pub(crate) async fn wait_readable(&mut self) -> Result<(), Error> {
+        if self.inner.state.load(Ordering::SeqCst) == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
+        }
+        let buf = self.recv_buf();
+        if buf.is_empty() {
+            tracing::debug!("wait_readable seqID:{}", self.id);
+            self.read_more(1, buf).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_available_into(
+        &mut self,
+        dst: &mut ReadBuf<'_>,
+        max_slices: usize,
+    ) -> Result<usize, Error> {
+        let buf = self.recv_buf();
+        if !self.check_read_ready(1, buf)? {
+            return Err(Error::NotEnoughData);
+        }
+        buf.read_available_into(dst, max_slices)
     }
 
     /// Read exactly `size` bytes as one contiguous buffer.
