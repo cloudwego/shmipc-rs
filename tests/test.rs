@@ -21,6 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -34,7 +35,7 @@ use shmipc::{
     stream::Stream,
     transport::{DefaultUnixConnect, DefaultUnixListen, TransportConnect},
 };
-use tokio::{io::AsyncReadExt, net::UnixStream};
+use tokio::{io::AsyncReadExt, net::UnixStream, sync::oneshot};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ping_pong_by_shmipc() {
@@ -149,6 +150,215 @@ async fn test_fallback_data_before_stream_close() {
             stream.close().await.unwrap();
         });
     });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_ext_reads_from_replaced_inner_stream() {
+    const OLD_RESPONSE: &[u8; 3] = b"old";
+    const NEW_RESPONSE: &[u8; 3] = b"new";
+
+    let rand = rand::random::<u64>();
+    let path = format!("/tmp/shmipc-stream-ext-replace-{}.sock", rand);
+    let mut sm_config = benchmark_config();
+    sm_config
+        .config_mut()
+        .share_memory_path_prefix
+        .push_str(rand.to_string().as_str());
+    sm_config = sm_config.with_session_num(1);
+
+    let mut server = Listener::new(
+        DefaultUnixListen,
+        SocketAddr::from_pathname(path.clone()).unwrap(),
+        sm_config.config().clone(),
+    )
+    .await
+    .unwrap();
+
+    tokio_scoped::scope(|s| {
+        s.spawn(async move {
+            for _ in 0..2 {
+                let mut stream = server.accept().await.unwrap();
+                let request = stream.read_exact_bytes(1).await.unwrap();
+                let response = match request[0] {
+                    b'o' => OLD_RESPONSE,
+                    b'n' => NEW_RESPONSE,
+                    byte => panic!("unexpected request marker: {byte}"),
+                };
+                drop(request);
+                must_write_bytes(&mut stream, response).await;
+            }
+        });
+        s.spawn(async move {
+            let client = SessionManager::new(
+                sm_config,
+                DefaultUnixConnect,
+                SocketAddr::from_pathname(path).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let mut old_stream = client.get_stream().unwrap();
+            must_write_bytes(&mut old_stream, b"o").await;
+            let mut new_stream = client.get_stream().unwrap();
+            must_write_bytes(&mut new_stream, b"n").await;
+
+            let mut stream = StreamExt::new(old_stream);
+            *stream.inner_mut() = new_stream;
+
+            let mut response = [0; NEW_RESPONSE.len()];
+            within("read replacement stream", stream.read_exact(&mut response))
+                .await
+                .unwrap();
+            assert_eq!(&response, NEW_RESPONSE);
+        });
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_exact_read_preserves_partial_data_on_peer_eof() {
+    run_partial_eof_exact_read(true).await;
+    run_partial_eof_exact_read(false).await;
+}
+
+async fn run_partial_eof_exact_read(close_before_read: bool) {
+    const DATA: &[u8] = b"partial response";
+
+    let rand = rand::random::<u64>();
+    let path = format!("/tmp/shmipc-partial-eof-{}.sock", rand);
+    let mut sm_config = benchmark_config();
+    sm_config
+        .config_mut()
+        .share_memory_path_prefix
+        .push_str(rand.to_string().as_str());
+    sm_config = sm_config.with_session_num(1);
+
+    let mut server = Listener::new(
+        DefaultUnixListen,
+        SocketAddr::from_pathname(path.clone()).unwrap(),
+        sm_config.config().clone(),
+    )
+    .await
+    .unwrap();
+    let (close_tx, close_rx) = oneshot::channel();
+
+    tokio_scoped::scope(|s| {
+        s.spawn(async move {
+            let mut stream = server.accept().await.unwrap();
+            let peeked = within("receive partial data", stream.peek(DATA.len()))
+                .await
+                .unwrap();
+            assert_eq!(&peeked[..], DATA);
+            drop(peeked);
+
+            let err = if close_before_read {
+                close_tx.send(()).unwrap();
+                within("observe peer half-close", async {
+                    while stream.is_open() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                stream.read_exact_bytes(DATA.len() + 1).await.unwrap_err()
+            } else {
+                let mut exact = Box::pin(stream.read_exact_bytes(DATA.len() + 1));
+                futures::future::poll_fn(|cx| match exact.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Ready(()),
+                    Poll::Ready(_) => panic!("exact read completed before peer half-close"),
+                })
+                .await;
+                close_tx.send(()).unwrap();
+                let err = within("wake exact read on peer half-close", exact.as_mut())
+                    .await
+                    .unwrap_err();
+                drop(exact);
+                err
+            };
+            assert!(matches!(err, Error::EndOfStream));
+
+            let chunk = stream.read_chunk().await.unwrap();
+            assert_eq!(&chunk[..], DATA);
+            drop(chunk);
+            assert!(matches!(stream.read_chunk().await, Err(Error::EndOfStream)));
+        });
+        s.spawn(async move {
+            let client = SessionManager::new(
+                sm_config,
+                DefaultUnixConnect,
+                SocketAddr::from_pathname(path).unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut stream = client.get_stream().unwrap();
+            must_write_bytes(&mut stream, DATA).await;
+            close_rx.await.unwrap();
+            stream.close().await.unwrap();
+        });
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_local_close_always_reports_stream_closed() {
+    let rand = rand::random::<u64>();
+    let path = format!("/tmp/shmipc-local-close-{}.sock", rand);
+    let mut sm_config = benchmark_config();
+    sm_config
+        .config_mut()
+        .share_memory_path_prefix
+        .push_str(rand.to_string().as_str());
+    sm_config = sm_config.with_session_num(1);
+
+    let server = Listener::new(
+        DefaultUnixListen,
+        SocketAddr::from_pathname(path.clone()).unwrap(),
+        sm_config.config().clone(),
+    )
+    .await
+    .unwrap();
+
+    tokio_scoped::scope(|s| {
+        s.spawn(async move {
+            let client = SessionManager::new(
+                sm_config,
+                DefaultUnixConnect,
+                SocketAddr::from_pathname(path).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let mut closed_before_read = client.get_stream().unwrap();
+            closed_before_read.close().await.unwrap();
+            assert!(
+                closed_before_read
+                    .read_exact_bytes(0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                closed_before_read.read_exact_bytes(1).await,
+                Err(Error::StreamClosed)
+            ));
+            assert!(matches!(
+                closed_before_read.read_chunk().await,
+                Err(Error::StreamClosed)
+            ));
+
+            let mut waiting_reader = client.get_stream().unwrap();
+            let mut closer = waiting_reader.clone();
+            let mut exact = Box::pin(waiting_reader.read_exact_bytes(1));
+            futures::future::poll_fn(|cx| match exact.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(_) => panic!("exact read completed before local close"),
+            })
+            .await;
+            closer.close().await.unwrap();
+            assert!(matches!(
+                within("wake exact read on local close", exact.as_mut()).await,
+                Err(Error::StreamClosed)
+            ));
+        });
+    });
+    server.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -537,6 +747,19 @@ async fn must_write(s: &mut Stream, size: u32) {
             Ok(_) => {
                 return;
             }
+        }
+    }
+}
+
+async fn must_write_bytes(s: &mut Stream, data: &[u8]) {
+    assert_eq!(s.write_bytes(data).unwrap(), data.len());
+    loop {
+        match s.flush(false).await {
+            Err(Error::QueueFull) => {
+                tokio::time::sleep(Duration::from_micros(1)).await;
+            }
+            Err(err) => panic!("must write bytes err:{err}"),
+            Ok(()) => return,
         }
     }
 }

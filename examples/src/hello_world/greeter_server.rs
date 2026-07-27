@@ -49,7 +49,10 @@ async fn main() {
 
 async fn handle_stream(mut stream: Stream) {
     loop {
-        let req_msg = match stream.read_bytes("client say hello world!!!".len()).await {
+        let req_msg = match stream
+            .read_exact_bytes("client say hello world!!!".len())
+            .await
+        {
             Ok(msg) => msg,
             Err(e) => {
                 eprintln!("failed to read msg, err: {e}");

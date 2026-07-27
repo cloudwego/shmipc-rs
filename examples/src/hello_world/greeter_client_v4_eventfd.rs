@@ -44,7 +44,7 @@ async fn main() {
     );
     stream.flush(true).await.unwrap();
     let resp_msg = stream
-        .read_bytes("server hello world!!!".len())
+        .read_exact_bytes("server hello world!!!".len())
         .await
         .unwrap();
     println!(

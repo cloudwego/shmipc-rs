@@ -362,7 +362,34 @@ impl LinkedBuffer {
 }
 
 impl BufferReader for LinkedBuffer {
-    fn read_bytes(&mut self, mut size: usize) -> Result<Buf<'_>, Error> {
+    fn read_chunk(&mut self) -> Result<Buf<'_>, Error> {
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
+
+        while self
+            .slice_list
+            .front()
+            .is_some_and(|slice| slice.size() == 0)
+        {
+            self.read_next_slice();
+        }
+
+        let size = self
+            .slice_list
+            .front()
+            .map(BufferSlice::size)
+            .filter(|size| *size > 0)
+            .ok_or(Error::NotEnoughData)?;
+        if self.len < size {
+            return Err(Error::NotEnoughData);
+        }
+        let lease = self.pin_registry.acquire(self.slice_list.front().unwrap());
+        self.len -= size;
+        let bytes = self.slice_list.front_mut().unwrap().read(size);
+        Ok(Buf::Shm(ShmBuf::new(bytes, lease)))
+    }
+
+    fn read_exact_bytes(&mut self, mut size: usize) -> Result<Buf<'_>, Error> {
         if size == 0 {
             return Ok(Buf::Exm(Bytes::new()));
         }
@@ -569,6 +596,7 @@ mod tests {
         buffer::{BufferWriter, manager::BufferManager, slice::BufferSlice},
         config::SizePercentPair,
         consts::DEFAULT_SINGLE_BUFFER_SIZE,
+        error::Error,
     };
 
     fn init_shm() -> BufferManager {
@@ -620,7 +648,7 @@ mod tests {
         buf.done(true);
 
         for _ in 0..slice_num / 2 {
-            let r = buf.read_bytes(4096).unwrap();
+            let r = buf.read_exact_bytes(4096).unwrap();
             assert_eq!(4096, r.len());
         }
         {
@@ -660,7 +688,7 @@ mod tests {
         buffer.write_bytes(&data).unwrap();
         buffer.done(false);
 
-        let leased = buffer.read_bytes(data.len()).unwrap().into_bytes();
+        let leased = buffer.read_exact_bytes(data.len()).unwrap().into_bytes();
         let leased_clone = leased.clone();
         buffer.recycle();
 
@@ -686,7 +714,10 @@ mod tests {
         buffer.done(false);
         let remaining_after_write = manager.remain_size();
 
-        let leased = buffer.read_bytes(first_capacity).unwrap().into_bytes();
+        let leased = buffer
+            .read_exact_bytes(first_capacity)
+            .unwrap()
+            .into_bytes();
         buffer.discard(buffer.len()).unwrap();
         buffer.release_previous_read();
 
@@ -730,11 +761,14 @@ mod tests {
         let all = data_size * mock_data_array.len();
         assert_eq!(all, writer.len());
 
-        for (i, array) in mock_data_array.into_iter().enumerate() {
-            assert_eq!(all - i * data_size, writer.len());
-            let get = writer.read_bytes(data_size).unwrap();
-            assert_eq!(array, get);
+        let expected = mock_data_array.concat();
+        let mut actual = Vec::with_capacity(all);
+        while !writer.is_empty() {
+            let chunk = writer.read_chunk().unwrap();
+            assert!(!chunk.is_empty());
+            actual.extend_from_slice(&chunk);
         }
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -786,7 +820,7 @@ mod tests {
         buffer.write_bytes(&mock_data[..]).unwrap();
         buffer.done(true);
         assert_eq!(2, buffer.slice_list.size());
-        let get_bytes = buffer.read_bytes(mock_data_size).unwrap();
+        let get_bytes = buffer.read_exact_bytes(mock_data_size).unwrap();
         assert_eq!(mock_data, get_bytes);
     }
 
@@ -814,7 +848,60 @@ mod tests {
     }
 
     #[test]
-    fn test_linked_buffer_read_bytes() {
+    fn read_chunk_returns_one_non_empty_slice() {
+        let manager = Arc::new(init_shm());
+        let first = manager.alloc_shm_buffer(1024).unwrap();
+        let first_capacity = first.capacity();
+        let mut buffer = new_linked_buffer_with_slice(manager, first);
+
+        let first_data = vec![1u8; first_capacity];
+        let second_data = vec![2u8; 128];
+        buffer.write_bytes(&first_data).unwrap();
+        buffer.write_bytes(&second_data).unwrap();
+        buffer.done(false);
+
+        let first_chunk = buffer.read_chunk().unwrap();
+        assert_eq!(&first_chunk[..], first_data);
+        drop(first_chunk);
+
+        // The exhausted first slice remains at the front until the next read. `read_chunk` must
+        // retire it and return the next non-empty slice instead of reporting an empty read.
+        let second_chunk = buffer.read_chunk().unwrap();
+        assert_eq!(&second_chunk[..], second_data);
+        drop(second_chunk);
+
+        assert!(buffer.is_empty());
+        assert!(matches!(buffer.read_chunk(), Err(Error::NotEnoughData)));
+        assert_eq!(buffer.slice_list.size(), 0);
+        assert!(buffer.slice_list.write_slice.is_none());
+
+        let rewritten = [3u8; 32];
+        buffer.write_bytes(&rewritten).unwrap();
+        let chunk = buffer.read_chunk().unwrap();
+        assert_eq!(&chunk[..], rewritten);
+    }
+
+    #[test]
+    fn read_exact_bytes_is_atomic_when_data_is_insufficient() {
+        let manager = Arc::new(init_shm());
+        let first = manager.alloc_shm_buffer(1024).unwrap();
+        let mut buffer = new_linked_buffer_with_slice(manager, first);
+        let data = vec![3u8; 256];
+        buffer.write_bytes(&data).unwrap();
+        buffer.done(false);
+
+        assert!(matches!(
+            buffer.read_exact_bytes(data.len() + 1),
+            Err(Error::NotEnoughData)
+        ));
+        assert_eq!(buffer.len(), data.len());
+
+        let exact = buffer.read_exact_bytes(data.len()).unwrap();
+        assert_eq!(&exact[..], data);
+    }
+
+    #[test]
+    fn test_linked_buffer_read_exact_bytes() {
         let manager = Arc::new(init_shm());
 
         let create_buffer_writer = || {
@@ -845,7 +932,7 @@ mod tests {
                 // do nothing
                 _ = buf.peek(one_read_size);
 
-                let read_data = buf.read_bytes(one_read_size).unwrap();
+                let read_data = buf.read_exact_bytes(one_read_size).unwrap();
                 if read_data.is_empty() {
                     assert_eq!(one_read_size, 0);
                 } else {
@@ -854,7 +941,7 @@ mod tests {
                 read += one_read_size;
             }
             assert_eq!(1 << 21, read);
-            buf.read_bytes(0).unwrap();
+            buf.read_exact_bytes(0).unwrap();
             buf.release_previous_read();
         };
 
@@ -907,10 +994,10 @@ mod tests {
 
         writer.done(false);
 
-        let get_str = writer.read_bytes(str.len()).unwrap();
+        let get_str = writer.read_exact_bytes(str.len()).unwrap();
         assert_eq!(str, std::str::from_utf8(&get_str).unwrap());
 
-        let get_bytes = writer.read_bytes(str.len()).unwrap();
+        let get_bytes = writer.read_exact_bytes(str.len()).unwrap();
         assert_eq!(str.as_bytes(), &get_bytes[..]);
 
         let mut writer = (create_buffer_writer.clone())();
@@ -944,7 +1031,7 @@ mod tests {
         let mut remain = writer.len();
         for _ in 0..MSG_NUM {
             remain -= ONE_MSG_SIZE;
-            let get_data = writer.read_bytes(1024).unwrap();
+            let get_data = writer.read_exact_bytes(1024).unwrap();
             assert_eq!(ONE_MSG_SIZE, get_data.len());
             assert_eq!(remain, writer.len());
         }
@@ -960,13 +1047,13 @@ mod tests {
         loop {
             let remain_len = writer.len();
             if remain_len > read_size {
-                let r = writer.read_bytes(read_size).unwrap();
+                let r = writer.read_exact_bytes(read_size).unwrap();
                 for j in 0..r.len() {
                     assert_eq!(count as u8, r[j]);
                     count += 1;
                 }
             } else if remain_len > 0 {
-                let r = writer.read_bytes(writer.len()).unwrap();
+                let r = writer.read_exact_bytes(writer.len()).unwrap();
                 for j in 0..r.len() {
                     assert_eq!(count as u8, r[j]);
                     count += 1;

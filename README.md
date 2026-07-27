@@ -100,6 +100,17 @@ benchmark_parallel_ping_pong_by_uds_4194304b
 - [HelloWorldClient](examples/src/hello_world/greeter_client.rs)
 - [HelloWorldServer](examples/src/hello_world/greeter_server.rs)
 
+#### 0.2 read API migration
+
+The 0.2 API separates streaming reads from exact contiguous reads:
+
+- Replace `Stream::read()` with `Stream::read_chunk()` when consuming a stream or implementing
+  `AsyncRead`. Each call returns one non-empty contiguous buffer slice.
+- Replace `Stream::read_bytes(size)` with `Stream::read_exact_bytes(size)` when exactly `size`
+  contiguous bytes are required. A cross-slice result may be coalesced into owned memory.
+
+The old ambiguous method names are not retained as compatibility aliases.
+
 #### Protocol configuration
 
 `Config::default()` keeps the legacy behavior: file-path shared memory uses the V2 protocol and

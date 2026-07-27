@@ -25,17 +25,22 @@ pub use slice::BufferSlice;
 use crate::error::Error;
 
 pub trait BufferReader {
+    /// Read the first non-empty contiguous buffer slice.
+    ///
+    /// A zero-copy result pins its underlying slice until the returned [`Buf`] (or the
+    /// [`bytes::Bytes`] created by [`Buf::into_bytes`]) is dropped.
+    fn read_chunk(&mut self) -> Result<Buf<'_>, Error>;
+
     /// Read `size` bytes from shared memory.
     ///
     /// A zero-copy result pins its underlying slice until the returned [`Buf`] (or the
     /// [`bytes::Bytes`] created by [`Buf::into_bytes`]) is dropped.
-    fn read_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error>;
+    fn read_exact_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error>;
 
     /// Peek `size` byte from share memory.
     ///
-    /// The difference between `peek()` and `read_bytes()` is that
-    /// `peek()` don't influence the return value of length, but the `read_bytes()` will decrease
-    /// the unread size.
+    /// The difference between `peek()` and `read_exact_bytes()` is that `peek()` doesn't influence
+    /// the return value of length, but `read_exact_bytes()` decreases the unread size.
     ///
     /// A zero-copy result remains valid for its own lifetime, including across
     /// [`BufferReader::release_previous_read`].

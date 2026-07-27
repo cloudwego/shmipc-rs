@@ -1,12 +1,12 @@
-use crate::buffer::Buf;
+use bytes::Bytes;
 
 pub struct BufReader {
-    buf: Buf<'static>,
+    buf: Bytes,
     consumed: usize,
 }
 
 impl BufReader {
-    pub const fn new(buf: Buf<'static>) -> Self {
+    pub const fn new(buf: Bytes) -> Self {
         Self { buf, consumed: 0 }
     }
 
@@ -36,19 +36,18 @@ impl BufReader {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
 
     use super::BufReader;
-    use crate::buffer::Buf;
 
     const BUF_LEN: usize = 64;
     const READ_SIZE: usize = 16;
 
-    fn shm_buf(size: usize) -> Buf<'static> {
+    fn shm_buf(size: usize) -> Bytes {
         let mut buf = BytesMut::with_capacity(size);
         // SAFETY: just for testing
         unsafe { buf.set_len(size) };
-        Buf::Exm(buf.freeze())
+        buf.freeze()
     }
 
     #[test]

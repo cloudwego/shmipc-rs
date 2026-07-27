@@ -97,6 +97,17 @@ benchmark_parallel_ping_pong_by_uds_4194304b
 - [HelloWorld客户端](examples/src/hello_world/greeter_client.rs)
 - [HelloWorld服务端](examples/src/hello_world/greeter_server.rs)
 
+#### 0.2 读取 API 迁移
+
+0.2 将流式读取与指定长度的连续读取拆分为两个接口：
+
+- 流式消费或实现 `AsyncRead` 时，将 `Stream::read()` 替换为 `Stream::read_chunk()`；每次
+  返回一个非空的连续 buffer slice。
+- 明确需要连续 `size` 字节时，将 `Stream::read_bytes(size)` 替换为
+  `Stream::read_exact_bytes(size)`；跨 slice 时允许拼接为 owned buffer。
+
+旧接口名不保留兼容别名。
+
 #### 协议配置
 
 `Config::default()` 保持 legacy 行为：file-path 共享内存使用 V2 协议，memfd 共享内存使用 V3

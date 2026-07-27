@@ -123,6 +123,10 @@ impl Stream {
     pub const fn stream_id(&self) -> u32 {
         self.id
     }
+
+    pub(crate) fn shares_inner_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl Clone for Stream {
@@ -138,50 +142,41 @@ impl Clone for Stream {
 }
 
 impl Stream {
-    /// return underlying read buffer, whose'size >= minSize.
-    ///
-    /// if current's size is not enough, which will block until
-    /// the read buffer's size greater than minSize.
-    async fn read_more(&self, min_size: usize, buf: &mut LinkedBuffer) -> Result<(), Error> {
-        self.move_pending_data(buf);
-        let recv_len = buf.len();
-        if recv_len >= min_size {
-            return Ok(());
+    fn check_read_ready(&self, min_size: usize, buf: &LinkedBuffer) -> Result<bool, Error> {
+        let state = self.inner.state.load(Ordering::SeqCst);
+        if state == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
         }
-
-        if recv_len == 0 && self.inner.state.load(Ordering::SeqCst) != STREAM_OPENED {
+        if buf.len() >= min_size {
+            return Ok(true);
+        }
+        if state == STREAM_HALF_CLOSED {
             return Err(Error::EndOfStream);
         }
+        Ok(false)
+    }
 
+    /// Wait until the underlying read buffer contains at least `min_size` bytes.
+    async fn read_more(&self, min_size: usize, buf: &mut LinkedBuffer) -> Result<(), Error> {
         loop {
-            let recv_notified = self.inner.recv_notify.notified();
-            let close_notified = self.inner.close_notify.notified();
-
-            match futures::future::select(
-                std::pin::pin!(recv_notified),
-                std::pin::pin!(close_notified),
-            )
-            .await
-            {
-                futures::future::Either::Left(_) => {
-                    self.move_pending_data(buf);
-                    if buf.len() >= min_size {
-                        return Ok(());
-                    }
-                }
-                futures::future::Either::Right(_) => {
-                    self.move_pending_data(buf);
-                    if buf.len() >= min_size {
-                        return Ok(());
-                    }
-
-                    if self.inner.state.load(Ordering::SeqCst) == STREAM_HALF_CLOSED {
-                        return Err(Error::EndOfStream);
-                    }
-
-                    return Err(Error::StreamClosed);
-                }
+            self.move_pending_data(buf);
+            if self.check_read_ready(min_size, buf)? {
+                return Ok(());
             }
+
+            let mut recv_notified = std::pin::pin!(self.inner.recv_notify.notified());
+            let mut close_notified = std::pin::pin!(self.inner.close_notify.notified());
+            recv_notified.as_mut().enable();
+            close_notified.as_mut().enable();
+
+            // Register both notifications before checking state and pending data again. This
+            // prevents `notify_waiters` from being lost between the check and the await.
+            self.move_pending_data(buf);
+            if self.check_read_ready(min_size, buf)? {
+                return Ok(());
+            }
+
+            _ = futures::future::select(recv_notified, close_notified).await;
         }
     }
 
@@ -475,42 +470,51 @@ impl Stream {
         self.session.wait_for_send(None, event).await
     }
 
-    /// Read a shm buffer.
+    /// Read the first non-empty contiguous shm buffer chunk.
     ///
-    /// The length of this buffer depends on how much the peer writes at once.
+    /// The returned chunk never spans multiple underlying buffer slices.
     ///
-    /// To specify a length of buffer, refer to [`Stream::read_bytes`].
+    /// To read an exact length, refer to [`Stream::read_exact_bytes`].
     ///
     /// Call [`Stream::release_read_and_reuse`] after processing a response to make consumed
     /// storage available for stream reuse immediately. Any outstanding zero-copy buffer keeps
     /// only its own slice pinned until it is dropped.
-    pub async fn read(&mut self) -> Result<Buf<'_>, Error> {
+    pub async fn read_chunk(&mut self) -> Result<Buf<'_>, Error> {
+        if self.inner.state.load(Ordering::SeqCst) == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
+        }
         let buf = self.recv_buf();
         if buf.is_empty() {
-            tracing::debug!("read_bytes seqID:{}", self.id);
+            tracing::debug!("read_chunk seqID:{}", self.id);
             self.read_more(1, buf).await?;
         }
-        buf.read_bytes(buf.len())
+        buf.read_chunk()
     }
 
-    /// Read a buffer of at least the given size.
+    /// Read exactly `size` bytes as one contiguous buffer.
     ///
-    /// This function will return when enough data has been read. In other words, if there is not
-    /// enough data to fill the length, this function will block forever.
+    /// A single-slice result is zero-copy. A result spanning slices is coalesced into owned memory.
+    /// If the peer reaches EOF before `size` bytes are available, buffered data is left unconsumed.
     ///
-    /// To return immediately after getting a buffer, refer to [`Stream::read`].
-    pub async fn read_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
+    /// To read the next available contiguous chunk, refer to [`Stream::read_chunk`].
+    pub async fn read_exact_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
+        if size == 0 {
+            return self.recv_buf().read_exact_bytes(0);
+        }
+        if self.inner.state.load(Ordering::SeqCst) == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
+        }
         let buf = self.recv_buf();
         if buf.len() < size {
             tracing::debug!(
-                "read_bytes seqID:{} len:{} size:{}",
+                "read_exact_bytes seqID:{} len:{} size:{}",
                 self.id,
                 buf.len(),
                 size
             );
             self.read_more(size, buf).await?;
         }
-        buf.read_bytes(size)
+        buf.read_exact_bytes(size)
     }
 
     pub async fn peek(&mut self, size: usize) -> Result<Buf<'_>, Error> {

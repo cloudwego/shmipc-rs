@@ -121,6 +121,9 @@ impl SliceList {
             return None;
         };
         debug_assert_ne!(self.len, 0);
+        if self.write_slice == Some(front) {
+            self.write_slice = None;
+        }
         self.len -= 1;
         let front_ref = unsafe { front.as_mut() };
         self.front_slice = front_ref.next_slice;
@@ -579,6 +582,7 @@ mod tests {
         l.push_back(BufferSlice::new(None, &mut [0; 1024], 0, false));
         assert_eq!(l.front(), l.back());
         assert_eq!(1, l.size());
+        l.write_slice = l.front_slice;
 
         l.push_back(BufferSlice::new(None, &mut [0; 1024], 0, false));
         assert_eq!(2, l.size());
@@ -587,6 +591,7 @@ mod tests {
         l.pop_front();
         assert_eq!(1, l.size());
         assert_eq!(l.front(), l.back());
+        assert!(l.write().is_none());
 
         l.pop_front();
         assert_eq!(0, l.size());

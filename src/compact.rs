@@ -16,10 +16,11 @@ pub struct StreamExt {
 }
 
 impl StreamExt {
-    pub const fn new(inner: Stream) -> Self {
+    pub fn new(inner: Stream) -> Self {
+        let read_stream = inner.clone();
         Self {
             inner,
-            read_state: ReadState::Idle,
+            read_state: ReadState::Idle(read_stream),
             write_state: WriteState::Idle,
         }
     }
@@ -40,10 +41,29 @@ impl StreamExt {
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
 enum ReadState {
-    Idle,
-    Reading(BoxFuture<'static, Result<Buf<'static>, Error>>),
-    Consuming(crate::util::shmbuf_reader::BufReader),
-    Eof,
+    Idle(Stream),
+    Reading {
+        tracked_stream: Stream,
+        future: BoxFuture<'static, (Stream, Result<bytes::Bytes, Error>)>,
+    },
+    Consuming(Stream, crate::util::shmbuf_reader::BufReader),
+    Eof(Stream),
+    Transitioning,
+}
+
+impl ReadState {
+    fn belongs_to(&self, inner: &Stream) -> bool {
+        match self {
+            Self::Idle(stream)
+            | Self::Consuming(stream, _)
+            | Self::Eof(stream)
+            | Self::Reading {
+                tracked_stream: stream,
+                ..
+            } => stream.shares_inner_with(inner),
+            Self::Transitioning => false,
+        }
+    }
 }
 
 enum WriteState {
@@ -59,49 +79,71 @@ impl AsyncRead for StreamExt {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if !this.read_state.belongs_to(&this.inner) {
+            this.read_state = ReadState::Idle(this.inner.clone());
+        }
+
         loop {
-            match &mut this.read_state {
-                ReadState::Idle => {
-                    if buf.remaining() == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    let fut = this.inner.read();
-                    let fut: BoxFuture<'_, Result<Buf<'_>, Error>> = Box::pin(fut);
-                    // Safety:
-                    // The `fut` returned by `inner.read` captures the lifetime of `inner`.
-                    // Since `fut` is stored in `self.read_state` and `self` is pinned, `inner` will
-                    // remain valid as long as `fut` exists. We use `transmute`
-                    // to erase the lifetime, satisfying the static requirement
-                    // of `BoxFuture`.
-                    let fut: BoxFuture<'static, Result<Buf<'static>, Error>> =
-                        unsafe { std::mem::transmute(fut) };
-                    this.read_state = ReadState::Reading(fut);
+            match std::mem::replace(&mut this.read_state, ReadState::Transitioning) {
+                ReadState::Idle(mut stream) => {
+                    let tracked_stream = stream.clone();
+                    let fut = Box::pin(async move {
+                        let result = stream.read_chunk().await.map(Buf::into_bytes);
+                        (stream, result)
+                    });
+                    this.read_state = ReadState::Reading {
+                        tracked_stream,
+                        future: fut,
+                    };
                 }
-                ReadState::Reading(fut) => {
-                    let res = ready!(fut.as_mut().poll(cx));
+                ReadState::Reading {
+                    tracked_stream,
+                    mut future,
+                } => {
+                    let (stream, res) = match future.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            this.read_state = ReadState::Reading {
+                                tracked_stream,
+                                future,
+                            };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(res) => res,
+                    };
                     match res {
                         Ok(b) => {
-                            this.read_state =
-                                ReadState::Consuming(crate::util::shmbuf_reader::BufReader::new(b));
+                            this.read_state = ReadState::Consuming(
+                                stream,
+                                crate::util::shmbuf_reader::BufReader::new(b),
+                            );
                         }
                         Err(Error::EndOfStream) => {
                             // AsyncRead represents EOF by successfully reading zero bytes.
-                            this.read_state = ReadState::Eof;
+                            this.read_state = ReadState::Eof(stream);
                             return Poll::Ready(Ok(()));
                         }
                         Err(e) => {
-                            this.read_state = ReadState::Idle;
+                            this.read_state = ReadState::Idle(stream);
                             return Poll::Ready(Err(e.into()));
                         }
                     }
                 }
-                ReadState::Consuming(reader) => {
+                ReadState::Consuming(stream, mut reader) => {
                     if reader.read(buf) {
-                        this.read_state = ReadState::Idle;
+                        this.read_state = ReadState::Idle(stream);
+                    } else {
+                        this.read_state = ReadState::Consuming(stream, reader);
                     }
                     return Poll::Ready(Ok(()));
                 }
-                ReadState::Eof => return Poll::Ready(Ok(())),
+                ReadState::Eof(stream) => {
+                    this.read_state = ReadState::Eof(stream);
+                    return Poll::Ready(Ok(()));
+                }
+                ReadState::Transitioning => unreachable!("invalid transient read state"),
             }
         }
     }
@@ -198,5 +240,17 @@ impl AsyncWrite for StreamExt {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamExt;
+
+    fn assert_unpin<T: Unpin>() {}
+
+    #[test]
+    fn stream_ext_remains_unpin() {
+        assert_unpin::<StreamExt>();
     }
 }
