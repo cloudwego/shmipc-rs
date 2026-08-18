@@ -35,7 +35,11 @@ use shmipc::{
     stream::Stream,
     transport::{DefaultUnixConnect, DefaultUnixListen, TransportConnect},
 };
-use tokio::{io::AsyncReadExt, net::UnixStream, sync::oneshot};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
+    sync::oneshot,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ping_pong_by_shmipc() {
@@ -210,6 +214,65 @@ async fn stream_ext_reads_from_replaced_inner_stream() {
                 .await
                 .unwrap();
             assert_eq!(&response, NEW_RESPONSE);
+        });
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_ext_writes_to_replaced_inner_stream() {
+    let rand = rand::random::<u64>();
+    let path = format!("/tmp/shmipc-stream-ext-write-replace-{}.sock", rand);
+    let mut sm_config = benchmark_config();
+    sm_config
+        .config_mut()
+        .share_memory_path_prefix
+        .push_str(rand.to_string().as_str());
+    sm_config = sm_config.with_session_num(1);
+
+    let mut server = Listener::new(
+        DefaultUnixListen,
+        SocketAddr::from_pathname(path.clone()).unwrap(),
+        sm_config.config().clone(),
+    )
+    .await
+    .unwrap();
+
+    tokio_scoped::scope(|s| {
+        s.spawn(async move {
+            let mut old_stream = within("accept old stream", server.accept()).await.unwrap();
+            let old_request = within("read old stream", old_stream.read_exact_bytes(1))
+                .await
+                .unwrap();
+            assert_eq!(&old_request[..], b"o");
+
+            let mut new_stream = within("accept replacement stream", server.accept())
+                .await
+                .unwrap();
+            let new_request = within("read replacement stream", new_stream.read_exact_bytes(1))
+                .await
+                .unwrap();
+            assert_eq!(&new_request[..], b"n");
+        });
+        s.spawn(async move {
+            let client = SessionManager::new(
+                sm_config,
+                DefaultUnixConnect,
+                SocketAddr::from_pathname(path).unwrap(),
+            )
+            .await
+            .unwrap();
+
+            let mut old_stream = client.get_stream().unwrap();
+            must_write_bytes(&mut old_stream, b"o").await;
+            let new_stream = client.get_stream().unwrap();
+
+            let mut stream = StreamExt::new(old_stream);
+            *stream.inner_mut() = new_stream;
+            within("write replacement stream", async {
+                stream.write_all(b"n").await.unwrap();
+                stream.flush().await.unwrap();
+            })
+            .await;
         });
     });
 }
