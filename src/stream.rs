@@ -17,12 +17,12 @@ use std::{
     ptr::copy_nonoverlapping,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use tokio::sync::Notify;
+use tokio::{io::ReadBuf, sync::Notify};
 
 use crate::{
     buffer::{Buf, BufferReader, BufferWriter, linked::LinkedBuffer, slice::BufferSlice},
@@ -37,8 +37,33 @@ pub const STREAM_OPENED: u32 = 0;
 pub const STREAM_CLOSED: u32 = 1;
 pub const STREAM_HALF_CLOSED: u32 = 2;
 
+const QUEUE_FULL_RETRY_COUNT: usize = 10;
+const QUEUE_FULL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+async fn retry_queue_put<F>(close_notify: &Notify, mut put: F) -> Result<(), Error>
+where
+    F: FnMut() -> Result<(), Error>,
+{
+    for _ in 0..QUEUE_FULL_RETRY_COUNT {
+        if tokio::time::timeout(QUEUE_FULL_RETRY_INTERVAL, close_notify.notified())
+            .await
+            .is_ok()
+        {
+            return Err(Error::StreamClosed);
+        }
+
+        match put() {
+            Ok(()) => return Ok(()),
+            Err(Error::QueueFull) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(Error::QueueFull)
+}
+
 /// Stream is used to represent a logical stream within a session
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Stream {
     inner: Arc<StreamInner>,
     id: u32,
@@ -56,6 +81,7 @@ pub struct StreamInner {
     recv_notify: Notify,
     // if in_fallback_state is set to true, sending should use uds
     in_fallback_state: AtomicBool,
+    handle_count: AtomicUsize,
 }
 
 unsafe impl Sync for StreamInner {}
@@ -76,6 +102,7 @@ impl Stream {
                 close_notify,
                 recv_notify,
                 in_fallback_state: AtomicBool::new(false),
+                handle_count: AtomicUsize::new(1),
             }),
             session,
         }
@@ -96,53 +123,60 @@ impl Stream {
     pub const fn stream_id(&self) -> u32 {
         self.id
     }
+
+    pub(crate) fn shares_inner_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Clone for Stream {
+    fn clone(&self) -> Self {
+        self.inner.handle_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+            id: self.id,
+            session: self.session.clone(),
+            session_id: self.session_id,
+        }
+    }
 }
 
 impl Stream {
-    /// return underlying read buffer, whose'size >= minSize.
-    ///
-    /// if current's size is not enough, which will block until
-    /// the read buffer's size greater than minSize.
-    async fn read_more(&self, min_size: usize, buf: &mut LinkedBuffer) -> Result<(), Error> {
-        self.move_pending_data(buf);
-        let recv_len = buf.len();
-        if recv_len >= min_size {
-            return Ok(());
+    fn check_read_ready(&self, min_size: usize, buf: &LinkedBuffer) -> Result<bool, Error> {
+        let state = self.inner.state.load(Ordering::SeqCst);
+        if state == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
         }
-
-        if recv_len == 0 && self.inner.state.load(Ordering::SeqCst) != STREAM_OPENED {
+        if buf.len() >= min_size {
+            return Ok(true);
+        }
+        if state == STREAM_HALF_CLOSED {
             return Err(Error::EndOfStream);
         }
+        Ok(false)
+    }
 
+    /// Wait until the underlying read buffer contains at least `min_size` bytes.
+    async fn read_more(&self, min_size: usize, buf: &mut LinkedBuffer) -> Result<(), Error> {
         loop {
-            let recv_notified = self.inner.recv_notify.notified();
-            let close_notified = self.inner.close_notify.notified();
-
-            match futures::future::select(
-                std::pin::pin!(recv_notified),
-                std::pin::pin!(close_notified),
-            )
-            .await
-            {
-                futures::future::Either::Left(_) => {
-                    self.move_pending_data(buf);
-                    if buf.len() >= min_size {
-                        return Ok(());
-                    }
-                }
-                futures::future::Either::Right(_) => {
-                    self.move_pending_data(buf);
-                    if buf.len() >= min_size {
-                        return Ok(());
-                    }
-
-                    if self.inner.state.load(Ordering::SeqCst) == STREAM_HALF_CLOSED {
-                        return Err(Error::EndOfStream);
-                    }
-
-                    return Err(Error::StreamClosed);
-                }
+            self.move_pending_data(buf);
+            if self.check_read_ready(min_size, buf)? {
+                return Ok(());
             }
+
+            let mut recv_notified = std::pin::pin!(self.inner.recv_notify.notified());
+            let mut close_notified = std::pin::pin!(self.inner.close_notify.notified());
+            recv_notified.as_mut().enable();
+            close_notified.as_mut().enable();
+
+            // Register both notifications before checking state and pending data again. This
+            // prevents `notify_waiters` from being lost between the check and the await.
+            self.move_pending_data(buf);
+            if self.check_read_ready(min_size, buf)? {
+                return Ok(());
+            }
+
+            _ = futures::future::select(recv_notified, close_notified).await;
         }
     }
 
@@ -152,8 +186,8 @@ impl Stream {
             return;
         }
         let pre_len = buf.len();
-        for data in pending_data.drain(0..) {
-            if let Some(fallback_slice) = data.fallback_slice {
+        for mut data in pending_data.drain(0..) {
+            if let Some(fallback_slice) = data.fallback_slice.take() {
                 buf.append_buffer_slice(fallback_slice);
                 self.inner.in_fallback_state.store(true, Ordering::SeqCst);
                 continue;
@@ -226,7 +260,7 @@ impl Stream {
         let mut event = FallbackDataEvent([0u8; 16].as_mut_ptr());
         event.encode(
             buf_len as u32 + 16,
-            self.session.shared.communication_version,
+            self.session.shared.msg_version,
             self.id,
             stream_status,
         );
@@ -260,6 +294,10 @@ impl Stream {
     fn clean(&self) {
         self.session
             .on_stream_close(self.id, self.inner.state.load(Ordering::SeqCst));
+        self.clean_local_buffers();
+    }
+
+    fn clean_local_buffers(&self) {
         self.clean_pending_data();
         self.recv_buf().recycle();
         self.send_buf().recycle();
@@ -267,8 +305,8 @@ impl Stream {
 
     fn clean_pending_data(&self) {
         let mut pending_data = self.inner.pending_data.lock().unwrap();
-        for data in pending_data.drain(0..) {
-            if let Some(fallback_slice) = data.fallback_slice {
+        for mut data in pending_data.drain(0..) {
+            if let Some(fallback_slice) = data.fallback_slice.take() {
                 if !fallback_slice.is_from_shm {
                     unsafe {
                         _ = Vec::from_raw_parts(
@@ -425,48 +463,82 @@ impl Stream {
             let ptr = event.as_mut_ptr();
             copy_nonoverlapping(12_u32.to_be_bytes().as_ptr(), ptr, 4);
             copy_nonoverlapping(MAGIC_NUMBER.to_be_bytes().as_ptr(), ptr.offset(4), 2);
-            *ptr.offset(6) = self.session.shared.communication_version;
+            *ptr.offset(6) = self.session.shared.msg_version;
             *ptr.offset(7) = EventType::TYPE_STREAM_CLOSE.inner();
             copy_nonoverlapping(self.id.to_be_bytes().as_ptr(), ptr.offset(8), 4);
         }
         self.session.wait_for_send(None, event).await
     }
 
-    /// Read a shm buffer.
+    /// Read the first non-empty contiguous shm buffer chunk.
     ///
-    /// The length of this buffer depends on how much the peer writes at once.
+    /// The returned chunk never spans multiple underlying buffer slices.
     ///
-    /// To specify a length of buffer, refer to [`Stream::read_bytes`].
+    /// To read an exact length, refer to [`Stream::read_exact_bytes`].
     ///
-    /// NOTE: after using the buffer, you MUST explicitly call `stream.release_read_and_reuse()`
-    /// for releasing it, otherwise it will cause memory leak.
-    pub async fn read(&mut self) -> Result<Buf<'_>, Error> {
+    /// Call [`Stream::release_read_and_reuse`] after processing a response to make consumed
+    /// storage available for stream reuse immediately. Any outstanding zero-copy buffer keeps
+    /// only its own slice pinned until it is dropped.
+    pub async fn read_chunk(&mut self) -> Result<Buf<'_>, Error> {
+        if self.inner.state.load(Ordering::SeqCst) == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
+        }
         let buf = self.recv_buf();
         if buf.is_empty() {
-            tracing::debug!("read_bytes seqID:{}", self.id);
+            tracing::debug!("read_chunk seqID:{}", self.id);
             self.read_more(1, buf).await?;
         }
-        buf.read_bytes(buf.len())
+        buf.read_chunk()
     }
 
-    /// Read a buffer of at least the given size.
+    pub(crate) async fn wait_readable(&mut self) -> Result<(), Error> {
+        if self.inner.state.load(Ordering::SeqCst) == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
+        }
+        let buf = self.recv_buf();
+        if buf.is_empty() {
+            tracing::debug!("wait_readable seqID:{}", self.id);
+            self.read_more(1, buf).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_available_into(
+        &mut self,
+        dst: &mut ReadBuf<'_>,
+        max_slices: usize,
+    ) -> Result<usize, Error> {
+        let buf = self.recv_buf();
+        if !self.check_read_ready(1, buf)? {
+            return Err(Error::NotEnoughData);
+        }
+        buf.read_available_into(dst, max_slices)
+    }
+
+    /// Read exactly `size` bytes as one contiguous buffer.
     ///
-    /// This function will return when enough data has been read. In other words, if there is not
-    /// enough data to fill the length, this function will block forever.
+    /// A single-slice result is zero-copy. A result spanning slices is coalesced into owned memory.
+    /// If the peer reaches EOF before `size` bytes are available, buffered data is left unconsumed.
     ///
-    /// To return immediately after getting a buffer, refer to [`Stream::read`].
-    pub async fn read_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
+    /// To read the next available contiguous chunk, refer to [`Stream::read_chunk`].
+    pub async fn read_exact_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error> {
+        if size == 0 {
+            return self.recv_buf().read_exact_bytes(0);
+        }
+        if self.inner.state.load(Ordering::SeqCst) == STREAM_CLOSED {
+            return Err(Error::StreamClosed);
+        }
         let buf = self.recv_buf();
         if buf.len() < size {
             tracing::debug!(
-                "read_bytes seqID:{} len:{} size:{}",
+                "read_exact_bytes seqID:{} len:{} size:{}",
                 self.id,
                 buf.len(),
                 size
             );
             self.read_more(size, buf).await?;
         }
-        buf.read_bytes(size)
+        buf.read_exact_bytes(size)
     }
 
     pub async fn peek(&mut self, size: usize) -> Result<Buf<'_>, Error> {
@@ -548,41 +620,43 @@ impl Stream {
             .stats
             .queue_full_error_count
             .fetch_add(1, Ordering::SeqCst);
-        for _ in 0..10 {
-            if tokio::time::timeout(
-                Duration::from_millis(10),
-                self.inner.close_notify.notified(),
-            )
-            .await
-            .is_ok()
-            {
-                send_buf.recycle();
-                return Err(Error::StreamClosed);
-            }
-
-            match self
-                .session
+        let root_buf_offset = send_buf.root_buf_offset();
+        match retry_queue_put(&self.inner.close_notify, || {
+            self.session
                 .shared
                 .queue_manager
                 .send_queue
                 .put(QueueElement {
                     seq_id: self.id,
-                    offset_in_shm_buf: send_buf.root_buf_offset(),
+                    offset_in_shm_buf: root_buf_offset,
                     status: state,
-                }) {
-                Ok(_) => {
-                    let ret = self.session.wake_up_peer().await;
-                    send_buf.clean();
-                    return ret;
-                }
-                Err(Error::QueueFull) => continue,
-                Err(err) => {
-                    send_buf.recycle();
-                    return Err(err);
-                }
+                })
+        })
+        .await
+        {
+            Ok(()) => {
+                let ret = self.session.wake_up_peer().await;
+                send_buf.clean();
+                ret
+            }
+            // The queue never took ownership, so retain the buffer for a caller retry.
+            Err(Error::QueueFull) => Err(Error::QueueFull),
+            Err(err) => {
+                send_buf.recycle();
+                Err(err)
             }
         }
-        Ok(())
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // `LinkedBuffer` and fallback slices own raw allocations and therefore cannot clean
+        // themselves up. A peer close removes the stream from the session map without calling
+        // `clean`, so release any unread data when the final stream handle goes away.
+        if self.inner.handle_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.clean_local_buffers();
+        }
     }
 }
 
@@ -590,4 +664,49 @@ impl Stream {
 pub struct BufferSliceWrapper {
     pub(crate) fallback_slice: Option<BufferSlice>,
     pub(crate) offset: u32,
+}
+
+impl Drop for BufferSliceWrapper {
+    fn drop(&mut self) {
+        let Some(fallback_slice) = self.fallback_slice.take() else {
+            return;
+        };
+        if fallback_slice.is_from_shm {
+            tracing::warn!(
+                "fallback slice is from shm, offset:{}",
+                fallback_slice.offset_in_shm
+            );
+            return;
+        }
+        unsafe {
+            _ = Vec::from_raw_parts(
+                fallback_slice.data,
+                fallback_slice.cap as usize,
+                fallback_slice.cap as usize,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_queue_put_reports_persistent_queue_full() {
+        let close_notify = Notify::new();
+        let attempts = AtomicUsize::new(0);
+
+        let err = retry_queue_put(&close_notify, || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(Error::QueueFull)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, Error::QueueFull));
+        assert_eq!(attempts.load(Ordering::Relaxed), QUEUE_FULL_RETRY_COUNT);
+    }
 }

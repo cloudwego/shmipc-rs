@@ -5,7 +5,9 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{buffer::Buf, error::Error, stream::Stream};
+use crate::{error::Error, stream::Stream};
+
+const MAX_READ_SLICES_PER_POLL: usize = 64;
 
 /// [`Stream`] compatible with [`AsyncRead`] and [`AsyncWrite`].
 pub struct StreamExt {
@@ -16,11 +18,13 @@ pub struct StreamExt {
 }
 
 impl StreamExt {
-    pub const fn new(inner: Stream) -> Self {
+    pub fn new(inner: Stream) -> Self {
+        let read_stream = inner.clone();
+        let write_stream = inner.clone();
         Self {
             inner,
-            read_state: ReadState::Idle,
-            write_state: WriteState::Idle,
+            read_state: ReadState::Idle(read_stream),
+            write_state: WriteState::Idle(write_stream),
         }
     }
 
@@ -40,15 +44,48 @@ impl StreamExt {
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
 enum ReadState {
-    Idle,
-    Reading(BoxFuture<'static, Result<Buf<'static>, Error>>),
-    Consuming(crate::util::shmbuf_reader::BufReader),
+    Idle(Stream),
+    Reading {
+        tracked_stream: Stream,
+        future: BoxFuture<'static, (Stream, Result<(), Error>)>,
+    },
+    Eof(Stream),
+    Transitioning,
+}
+
+impl ReadState {
+    fn belongs_to(&self, inner: &Stream) -> bool {
+        match self {
+            Self::Idle(stream)
+            | Self::Eof(stream)
+            | Self::Reading {
+                tracked_stream: stream,
+                ..
+            } => stream.shares_inner_with(inner),
+            Self::Transitioning => false,
+        }
+    }
 }
 
 enum WriteState {
-    Idle,
-    Flushing(BoxFuture<'static, Result<(), Error>>),
-    Closing(BoxFuture<'static, Result<(), Error>>),
+    // Keep the write-side handle in the state machine so an in-flight future owns it instead of
+    // borrowing `StreamExt::inner` across poll calls.
+    Idle(Stream),
+    Flushing(BoxFuture<'static, (Stream, Result<(), Error>)>),
+    Closing(BoxFuture<'static, (Stream, Result<(), Error>)>),
+    Transitioning,
+}
+
+impl WriteState {
+    fn sync_idle_with(&mut self, inner: &Stream) {
+        // An operation that is already in flight finishes on the stream where it started. The
+        // next operation switches to a replacement installed through `StreamExt::inner_mut`.
+        if let Self::Idle(stream) = self
+            && !stream.shares_inner_with(inner)
+        {
+            *stream = inner.clone();
+        }
+    }
 }
 
 impl AsyncRead for StreamExt {
@@ -58,43 +95,79 @@ impl AsyncRead for StreamExt {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if !this.read_state.belongs_to(&this.inner) {
+            this.read_state = ReadState::Idle(this.inner.clone());
+        }
+
         loop {
-            match &mut this.read_state {
-                ReadState::Idle => {
-                    if buf.remaining() == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    let fut = this.inner.read();
-                    let fut: BoxFuture<'_, Result<Buf<'_>, Error>> = Box::pin(fut);
-                    // Safety:
-                    // The `fut` returned by `inner.read` captures the lifetime of `inner`.
-                    // Since `fut` is stored in `self.read_state` and `self` is pinned, `inner` will
-                    // remain valid as long as `fut` exists. We use `transmute`
-                    // to erase the lifetime, satisfying the static requirement
-                    // of `BoxFuture`.
-                    let fut: BoxFuture<'static, Result<Buf<'static>, Error>> =
-                        unsafe { std::mem::transmute(fut) };
-                    this.read_state = ReadState::Reading(fut);
+            match std::mem::replace(&mut this.read_state, ReadState::Transitioning) {
+                ReadState::Idle(mut stream) => {
+                    let tracked_stream = stream.clone();
+                    let fut = Box::pin(async move {
+                        let result = stream.wait_readable().await;
+                        (stream, result)
+                    });
+                    this.read_state = ReadState::Reading {
+                        tracked_stream,
+                        future: fut,
+                    };
                 }
-                ReadState::Reading(fut) => {
-                    let res = ready!(fut.as_mut().poll(cx));
+                ReadState::Reading {
+                    tracked_stream,
+                    mut future,
+                } => {
+                    let (mut stream, res) = match future.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            this.read_state = ReadState::Reading {
+                                tracked_stream,
+                                future,
+                            };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(res) => res,
+                    };
                     match res {
-                        Ok(b) => {
-                            this.read_state =
-                                ReadState::Consuming(crate::util::shmbuf_reader::BufReader::new(b));
+                        Ok(()) => {
+                            match stream.read_available_into(buf, MAX_READ_SLICES_PER_POLL) {
+                                Ok(read) => {
+                                    debug_assert!(read > 0);
+                                    this.read_state = ReadState::Idle(stream);
+                                    return Poll::Ready(Ok(()));
+                                }
+                                Err(Error::NotEnoughData) => {
+                                    // Another handle may have consumed the data after the wait
+                                    // completed. Wait again instead of exposing a spurious EOF.
+                                    this.read_state = ReadState::Idle(stream);
+                                }
+                                Err(Error::EndOfStream) => {
+                                    this.read_state = ReadState::Eof(stream);
+                                    return Poll::Ready(Ok(()));
+                                }
+                                Err(e) => {
+                                    this.read_state = ReadState::Idle(stream);
+                                    return Poll::Ready(Err(e.into()));
+                                }
+                            }
+                        }
+                        Err(Error::EndOfStream) => {
+                            // AsyncRead represents EOF by successfully reading zero bytes.
+                            this.read_state = ReadState::Eof(stream);
+                            return Poll::Ready(Ok(()));
                         }
                         Err(e) => {
-                            this.read_state = ReadState::Idle;
+                            this.read_state = ReadState::Idle(stream);
                             return Poll::Ready(Err(e.into()));
                         }
                     }
                 }
-                ReadState::Consuming(reader) => {
-                    if reader.read(buf) {
-                        this.read_state = ReadState::Idle;
-                    }
+                ReadState::Eof(stream) => {
+                    this.read_state = ReadState::Eof(stream);
                     return Poll::Ready(Ok(()));
                 }
+                ReadState::Transitioning => unreachable!("invalid transient read state"),
             }
         }
     }
@@ -103,31 +176,60 @@ impl AsyncRead for StreamExt {
 impl AsyncWrite for StreamExt {
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let this = self.get_mut();
-        Poll::Ready(this.inner.write_bytes(buf).map_err(Into::into))
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        loop {
+            this.write_state.sync_idle_with(&this.inner);
+            match &mut this.write_state {
+                WriteState::Idle(stream) => {
+                    return Poll::Ready(stream.write_bytes(buf).map_err(Into::into));
+                }
+                WriteState::Flushing(future) => {
+                    let (stream, result) = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle(stream);
+                    if let Err(error) = result {
+                        return Poll::Ready(Err(error.into()));
+                    }
+                }
+                WriteState::Closing(_) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "close in progress during write",
+                    )));
+                }
+                WriteState::Transitioning => unreachable!("invalid transient write state"),
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         let this = self.get_mut();
 
         loop {
+            this.write_state.sync_idle_with(&this.inner);
             match &mut this.write_state {
-                WriteState::Idle => {
-                    let fut = this.inner.flush(true);
-                    let fut: BoxFuture<'_, Result<(), Error>> = Box::pin(fut);
-                    // Safety:
-                    // Similar to poll_read, `fut` captures `inner`. `inner` is pinned via `self`.
-                    let fut: BoxFuture<'static, Result<(), Error>> =
-                        unsafe { std::mem::transmute(fut) };
-                    this.write_state = WriteState::Flushing(fut);
+                WriteState::Idle(_) => {
+                    let WriteState::Idle(mut stream) =
+                        std::mem::replace(&mut this.write_state, WriteState::Transitioning)
+                    else {
+                        unreachable!();
+                    };
+                    let future = Box::pin(async move {
+                        let result = stream.flush(true).await;
+                        (stream, result)
+                    });
+                    this.write_state = WriteState::Flushing(future);
                 }
-                WriteState::Flushing(fut) => {
-                    let res = ready!(fut.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle;
-                    match res {
+                WriteState::Flushing(future) => {
+                    let (stream, result) = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle(stream);
+                    match result {
                         Ok(_) | Err(Error::StreamClosed) => return Poll::Ready(Ok(())),
                         Err(e) => return Poll::Ready(Err(e.into())),
                     }
@@ -137,6 +239,7 @@ impl AsyncWrite for StreamExt {
                         "close in progress during flush",
                     )));
                 }
+                WriteState::Transitioning => unreachable!("invalid transient write state"),
             }
         }
     }
@@ -148,48 +251,51 @@ impl AsyncWrite for StreamExt {
         let this = self.get_mut();
 
         loop {
+            this.write_state.sync_idle_with(&this.inner);
             match &mut this.write_state {
-                WriteState::Idle => {
-                    let fut = this.inner.close();
-                    let fut: BoxFuture<'_, Result<(), Error>> = Box::pin(fut);
-                    // Safety:
-                    // Similar to poll_read, `fut` captures `inner`. `inner` is pinned via `self`.
-                    let fut: BoxFuture<'static, Result<(), Error>> =
-                        unsafe { std::mem::transmute(fut) };
-                    this.write_state = WriteState::Closing(fut);
+                WriteState::Idle(_) => {
+                    let WriteState::Idle(mut stream) =
+                        std::mem::replace(&mut this.write_state, WriteState::Transitioning)
+                    else {
+                        unreachable!();
+                    };
+                    let future = Box::pin(async move {
+                        let result = stream.close().await;
+                        (stream, result)
+                    });
+                    this.write_state = WriteState::Closing(future);
                 }
-                WriteState::Closing(fut) => {
-                    let res = ready!(fut.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle;
-                    match res {
+                WriteState::Closing(future) => {
+                    let (stream, result) = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle(stream);
+                    match result {
                         Ok(_) => return Poll::Ready(Ok(())),
                         Err(e) => {
                             return Poll::Ready(Err(e.into()));
                         }
                     }
                 }
-                WriteState::Flushing(_) => {
-                    // If we are flushing, we need to drive the flush to completion first.
-                    // Since we are in poll_shutdown, and it requires a mutable reference,
-                    // and poll_flush also requires one, we can't easily call self.poll_flush(cx).
-                    // Instead, we just poll the existing flush future directly here.
-
-                    // Note: We rely on the loop to re-enter this match arm.
-                    // However, the Flushing state holds a future that needs to be polled.
-                    // We can extract the future temporarily or match on it.
-                    // But wait, `this.write_state` is `&mut WriteState`.
-                    let WriteState::Flushing(fut) = &mut this.write_state else {
-                        unreachable!();
-                    };
-                    let res = ready!(fut.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle;
-                    if let Err(e) = res {
+                WriteState::Flushing(future) => {
+                    let (stream, result) = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle(stream);
+                    if let Err(e) = result {
                         return Poll::Ready(Err(e.into()));
                     }
-                    // Flush completed, continue loop to start closing
-                    continue;
                 }
+                WriteState::Transitioning => unreachable!("invalid transient write state"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamExt;
+
+    fn assert_unpin<T: Unpin>() {}
+
+    #[test]
+    fn stream_ext_remains_unpin() {
+        assert_unpin::<StreamExt>();
     }
 }

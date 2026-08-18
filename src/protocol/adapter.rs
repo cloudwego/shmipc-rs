@@ -24,15 +24,19 @@ use super::{
         ProtocolInitializer, block_read_event_header,
         v2::{Client as V2Client, ProtocolInitializerV2, Server as V2Server},
         v3::{Client as V3Client, ProtocolInitializerV3, Server as V3Server},
+        v4::{Client as V4Client, ProtocolInitializerV4, Server as V4Server},
         wait_event_header,
     },
     protocol_trace,
 };
-use crate::consts::{HEADER_SIZE, MAX_SUPPORT_PROTO_VERSION, MemMapType};
+use crate::{
+    config::{Config, ProtocolMode},
+    consts::{HEADER_SIZE, MAX_LEGACY_PROTO_VERSION, MAX_SUPPORT_PROTO_VERSION, MemMapType},
+};
 
 pub struct ClientProtocolAdapter {
     conn_fd: RawFd,
-    mem_map_type: MemMapType,
+    config: Config,
     buffer_path: String,
     queue_path: String,
     buffer_fd: RawFd,
@@ -42,7 +46,7 @@ pub struct ClientProtocolAdapter {
 impl ClientProtocolAdapter {
     pub const fn new(
         conn_fd: RawFd,
-        mem_map_type: MemMapType,
+        config: Config,
         buffer_path: String,
         queue_path: String,
         buffer_fd: RawFd,
@@ -50,7 +54,7 @@ impl ClientProtocolAdapter {
     ) -> Self {
         Self {
             conn_fd,
-            mem_map_type,
+            config,
             buffer_path,
             queue_path,
             buffer_fd,
@@ -59,8 +63,21 @@ impl ClientProtocolAdapter {
     }
 
     pub fn get_initializer(self) -> Result<ProtocolInitializer, anyhow::Error> {
+        if matches!(self.config.protocol.mode, ProtocolMode::V4 { .. }) {
+            return Ok(ProtocolInitializer::V4(ProtocolInitializerV4::Client(
+                Box::new(V4Client {
+                    conn_fd: self.conn_fd,
+                    config: self.config,
+                    buffer_path: self.buffer_path,
+                    queue_path: self.queue_path,
+                    buffer_fd: self.buffer_fd,
+                    queue_fd: self.queue_fd,
+                }),
+            )));
+        }
+
         // temporarily ensure version compatibility.
-        if let MemMapType::MemMapTypeDevShmFile = self.mem_map_type {
+        if let MemMapType::MemMapTypeDevShmFile = self.config.mem_map_type {
             return Ok(ProtocolInitializer::V2(ProtocolInitializerV2::Client(
                 V2Client {
                     conn_fd: self.conn_fd,
@@ -71,7 +88,7 @@ impl ClientProtocolAdapter {
         }
         // send version to peer
         let mut h = Header([0; HEADER_SIZE].as_mut_ptr());
-        let client_version = MAX_SUPPORT_PROTO_VERSION;
+        let client_version = MAX_LEGACY_PROTO_VERSION;
         h.encode(
             HEADER_SIZE as u32,
             client_version,
@@ -106,7 +123,7 @@ impl ClientProtocolAdapter {
             3 => Ok(ProtocolInitializer::V3(ProtocolInitializerV3::Client(
                 V3Client {
                     conn_fd: self.conn_fd,
-                    mem_map_type: self.mem_map_type,
+                    mem_map_type: self.config.mem_map_type,
                     buffer_fd: self.buffer_fd,
                     queue_fd: self.queue_fd,
                     buffer_path: self.buffer_path,
@@ -136,22 +153,28 @@ impl ServerProtocolAdapter {
         let mut buf = vec![0u8; HEADER_SIZE];
         let h = block_read_event_header(self.conn_fd, &mut buf)?;
         std::mem::forget(buf);
-        match h.version() {
-            2 => Ok(ProtocolInitializer::V2(ProtocolInitializerV2::Server(
-                V2Server {
+        match h.msg_type() {
+            EventType::TYPE_SHARE_MEMORY_BY_FILE_PATH => Ok(ProtocolInitializer::V2(
+                ProtocolInitializerV2::Server(V2Server {
                     conn_fd: self.conn_fd,
                     first_event: h,
-                },
-            ))),
-            3 => Ok(ProtocolInitializer::V3(ProtocolInitializerV3::Server(
-                V3Server {
+                }),
+            )),
+            EventType::TYPE_EXCHANGE_PROTO_VERSION => Ok(ProtocolInitializer::V3(
+                ProtocolInitializerV3::Server(V3Server {
                     conn_fd: self.conn_fd,
                     first_event: h,
-                },
-            ))),
-            version => Err(anyhow!(
-                "not support the protocol version:{}, max_support_version is {}",
-                version,
+                }),
+            )),
+            EventType::TYPE_NEGOTIATION => Ok(ProtocolInitializer::V4(
+                ProtocolInitializerV4::Server(V4Server {
+                    conn_fd: self.conn_fd,
+                    first_event: h,
+                }),
+            )),
+            msg_type => Err(anyhow!(
+                "not support the first protocol message type:{}, max_support_version is {}",
+                msg_type,
                 MAX_SUPPORT_PROTO_VERSION
             )),
         }

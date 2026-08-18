@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{os::fd::RawFd, sync::Arc};
+use std::os::fd::RawFd;
 
 use anyhow::anyhow;
 
 use super::{
-    block_read_event_header, block_write_full, handle_exchange_version,
+    ProtocolInitialized, block_read_event_header, block_write_full, handle_exchange_version,
     handle_share_memory_by_file_path, handle_share_memory_by_memfd, send_memfd_to_peer,
     send_share_memory_by_file_path, wait_event_header,
 };
 use crate::{
-    buffer::manager::BufferManager,
     consts::{HEADER_SIZE, MemMapType},
     protocol::{event::EventType, header::Header, protocol_trace},
-    queue::QueueManager,
 };
 
 pub enum ProtocolInitializerV3 {
@@ -34,15 +32,11 @@ pub enum ProtocolInitializerV3 {
 }
 
 impl ProtocolInitializerV3 {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
         match self {
             ProtocolInitializerV3::Client(client) => client.init(),
             ProtocolInitializerV3::Server(server) => server.init(),
         }
-    }
-
-    pub const fn version() -> u8 {
-        3
     }
 }
 
@@ -56,7 +50,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
         match self.mem_map_type {
             MemMapType::MemMapTypeDevShmFile => {
                 send_share_memory_by_file_path(self.conn_fd, &self.buffer_path, &self.queue_path, 3)
@@ -72,7 +66,7 @@ impl Client {
         }?;
         let mut buf = [0u8; HEADER_SIZE];
         wait_event_header(self.conn_fd, EventType::TYPE_ACK_SHARE_MEMORY, &mut buf)?;
-        Ok(None)
+        Ok(ProtocolInitialized::legacy(None, 3))
     }
 }
 
@@ -82,7 +76,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn init(&self) -> Result<Option<(Arc<BufferManager>, QueueManager)>, anyhow::Error> {
+    pub fn init(&self) -> Result<ProtocolInitialized, anyhow::Error> {
         if EventType::TYPE_EXCHANGE_PROTO_VERSION != self.first_event.msg_type() {
             return Err(anyhow!(
                 "ProtocolInitializerV3 expect first event is:{}({}),but:{}",
@@ -110,10 +104,10 @@ impl Server {
         })?;
         let r = match h.msg_type() {
             EventType::TYPE_SHARE_MEMORY_BY_FILE_PATH => {
-                handle_share_memory_by_file_path(self.conn_fd, &h)
+                handle_share_memory_by_file_path(self.conn_fd, &h, 3)
             }
             EventType::TYPE_SHARE_MEMORY_BY_MEMFD => {
-                handle_share_memory_by_memfd(self.conn_fd, &h, 3)
+                handle_share_memory_by_memfd(self.conn_fd, &h, 3, 3)
             }
             _ => {
                 return Err(anyhow!(
@@ -131,6 +125,6 @@ impl Server {
         block_write_full(self.conn_fd, unsafe {
             std::slice::from_raw_parts(resp_header.0, HEADER_SIZE)
         })?;
-        Ok(r)
+        Ok(ProtocolInitialized::legacy(r, 3))
     }
 }

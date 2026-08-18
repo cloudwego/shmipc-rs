@@ -25,6 +25,7 @@ use super::{Session, config::SessionManagerConfig};
 use crate::{
     consts::StateType,
     error::Error,
+    stats::StatsSnapshot,
     stream::Stream,
     transport::{TransportConnect, TransportStream},
 };
@@ -133,6 +134,15 @@ where
             .load()
             .put_or_close_stream(stream)
             .await;
+    }
+
+    /// Return a point-in-time sum of all currently managed session counters.
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        let mut snapshot = StatsSnapshot::default();
+        for session in &self.inner.sessions {
+            snapshot.add_assign(session.load().stats_snapshot());
+        }
+        snapshot
     }
 
     /// Close all sessions in SessionManager.

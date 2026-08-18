@@ -1,6 +1,6 @@
 [package]
 name = "shmipc"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Volo Team <volo@cloudwego.io>"]
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 pin-project = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
@@ -48,4 +49,8 @@ members = ["examples"]
 
 [[bench]]
 name = "bench"
+harness = false
+
+[[bench]]
+name = "v4_protocol_matrix"
 harness = false

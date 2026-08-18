@@ -18,6 +18,7 @@ pub mod pool;
 
 use std::{
     collections::HashMap,
+    os::fd::{AsRawFd, OwnedFd},
     sync::{
         Arc, LazyLock, Mutex, OnceLock, RwLock,
         atomic::{AtomicU32, Ordering},
@@ -40,13 +41,16 @@ use crate::{
         manager::{BufferManager, add_global_buffer_manager_ref_count},
         slice::BufferSlice,
     },
-    config::Config,
+    config::{Config, ProtocolConfig, ProtocolMode},
     consts::{EPOCH_INFO_MAX_LEN, FILE_NAME_MAX_LEN, HEADER_SIZE, MemMapType, QUEUE_INFO_MAX_LEN},
     error::Error,
     protocol::{
         event::{EventType, POLLING_EVENT_WITH_VERSION, check_event_valid},
+        event_fd::{drain_eventfd, write_eventfd},
         header::Header,
         init_client_protocol, init_manager, init_server_protocol,
+        initializer::v4::V4ClientInitError,
+        negotiation::NegotiatedFeature,
     },
     queue::QueueManager,
     stats::Stats,
@@ -79,7 +83,10 @@ pub(crate) struct Shared {
     next_stream_id: AtomicU32,
     pub(crate) buffer_manager: Arc<BufferManager>,
     pub(crate) queue_manager: QueueManager,
-    pub(crate) communication_version: u8,
+    pub(crate) proto_version: u8,
+    pub(crate) msg_version: u8,
+    pub(crate) negotiated_feature: NegotiatedFeature,
+    pub(crate) eventfd_send: Option<OwnedFd>,
     pub(crate) name: String,
     pool: StreamPool,
     streams: RwLock<HashMap<u32, Stream>>,
@@ -97,6 +104,8 @@ pub(crate) struct Shared {
     // pub(crate) peer_addr: SocketAddr,
     read_loop: OnceLock<JoinHandle<()>>,
     write_loop: OnceLock<JoinHandle<()>>,
+    polling_loop: OnceLock<JoinHandle<()>>,
+    eventfd_loop: OnceLock<JoinHandle<()>>,
 }
 
 impl Drop for Shared {
@@ -105,6 +114,12 @@ impl Drop for Shared {
             handle.abort();
         }
         if let Some(handle) = self.write_loop.get() {
+            handle.abort();
+        }
+        if let Some(handle) = self.polling_loop.get() {
+            handle.abort();
+        }
+        if let Some(handle) = self.eventfd_loop.get() {
             handle.abort();
         }
     }
@@ -117,6 +132,10 @@ pub struct SendReady {
 }
 
 impl Session {
+    pub(crate) fn stats_snapshot(&self) -> crate::stats::StatsSnapshot {
+        self.shared.stats.snapshot()
+    }
+
     pub async fn client<C>(
         session_id: usize,
         epoch_id: u64,
@@ -129,9 +148,8 @@ impl Session {
         C: TransportConnect,
         <C::Stream as TransportStream>::ReadHalf: Send + 'static,
         <C::Stream as TransportStream>::WriteHalf: Send + 'static,
+        C::Address: Clone,
     {
-        let conn_stream = connect.connect(addr).await?;
-
         sm_config
             .config_mut()
             .share_memory_path_prefix
@@ -158,7 +176,37 @@ impl Session {
             );
         }
 
-        Ok(Self::new(sm_config.config().clone(), conn_stream, None).await?)
+        let config = sm_config.config().clone();
+        let conn_stream = connect.connect(addr.clone()).await?;
+        match Self::new(config.clone(), conn_stream, None).await {
+            Ok(session) => Ok(session),
+            Err(err)
+                if matches!(config.protocol.mode, ProtocolMode::V4 { fallback: true })
+                    && is_v4_fallback_error(&err) =>
+            {
+                let mut fallback_config = config;
+                fallback_config.protocol = ProtocolConfig::default();
+                let conn_stream = match connect.connect(addr).await {
+                    Ok(conn_stream) => conn_stream,
+                    Err(fallback_error) => {
+                        return Err(anyhow::Error::new(V4FallbackFailed {
+                            v4_error: err,
+                            fallback_error: anyhow::Error::new(fallback_error),
+                        })
+                        .into());
+                    }
+                };
+                match Self::new(fallback_config, conn_stream, None).await {
+                    Ok(session) => Ok(session),
+                    Err(fallback_error) => Err(anyhow::Error::new(V4FallbackFailed {
+                        v4_error: err,
+                        fallback_error,
+                    })
+                    .into()),
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub async fn server<S>(
@@ -191,7 +239,6 @@ impl Session {
             .map_err(|err| err.context("verify config failed"))?;
 
         let conn_fd = conn_stream.as_raw_fd();
-        let (owned_read_half, owned_write_half) = conn_stream.into_split();
         let is_client = accept_tx.is_none();
 
         let mut nonblocking = false as libc::c_int;
@@ -208,24 +255,47 @@ impl Session {
         // on server mode the backend task will use accept_ch to transfer new stream.
         let next_stream_id = if !is_client { 2 } else { 1 };
 
-        let (bm, qm, communication_version) = if is_client {
-            let (bm, qm) = init_manager(&mut config).map_err(|err| {
+        let (bm, qm, protocol_initialized) = if is_client {
+            let proto_version = crate::protocol::initial_client_proto_version(&config);
+            let (bm, qm) = init_manager(&mut config, proto_version).map_err(|err| {
                 anyhow!("create share memory buffer manager failed, error={}", err)
             })?;
-            let version = init_client_protocol(
+            let initialized = match init_client_protocol(
                 bm.path.clone(),
                 bm.memfd,
                 qm.path.clone(),
                 qm.memfd,
                 conn_fd,
-                config.mem_map_type,
+                config.clone(),
                 config.initialize_timeout,
             )
-            .await?;
-            (bm, qm, version)
+            .await
+            {
+                Ok(initialized) => initialized,
+                Err(err) => {
+                    let buffer_path = bm.path.clone();
+                    qm.unmap();
+                    add_global_buffer_manager_ref_count(&buffer_path, -1).await;
+                    return Err(err);
+                }
+            };
+            (bm, qm, initialized)
         } else {
-            init_server_protocol(conn_fd, config.initialize_timeout).await?
+            let mut initialized = init_server_protocol(conn_fd, config.initialize_timeout).await?;
+            let (bm, qm) = initialized
+                .shared_memory
+                .take()
+                .ok_or_else(|| anyhow!("server protocol did not initialize shared memory"))?;
+            (bm, qm, initialized)
         };
+
+        let (eventfd_send, eventfd_recv) = match protocol_initialized.eventfd {
+            Some(eventfd) => (Some(eventfd.wakeup_send), Some(eventfd.wakeup_recv)),
+            None => (None, None),
+        };
+        let negotiated_feature = protocol_initialized.feature;
+        let proto_version = protocol_initialized.proto_version;
+        let msg_version = protocol_initialized.msg_version;
 
         let (send_tx, send_rx) = mpsc::channel::<SendReady>(4096);
 
@@ -239,6 +309,7 @@ impl Session {
                 ));
             }
         };
+        let (owned_read_half, owned_write_half) = conn_stream.into_split();
 
         let session = Session {
             shared: Arc::new(Shared {
@@ -248,7 +319,10 @@ impl Session {
                 buffer_manager: bm,
                 name: qm.path.clone(),
                 queue_manager: qm,
-                communication_version,
+                proto_version,
+                msg_version,
+                negotiated_feature,
+                eventfd_send,
                 shutdown: AtomicU32::new(0),
                 unhealthy: AtomicU32::new(0),
                 send_tx,
@@ -261,8 +335,26 @@ impl Session {
                 // peer_addr,
                 read_loop: OnceLock::new(),
                 write_loop: OnceLock::new(),
+                polling_loop: OnceLock::new(),
+                eventfd_loop: OnceLock::new(),
             }),
         };
+
+        if let NegotiatedFeature::EventQueuePolling { interval } = negotiated_feature {
+            session
+                .shared
+                .polling_loop
+                .set(tokio::spawn(session.clone().polling_loop(interval)))
+                .unwrap();
+        }
+
+        if let Some(eventfd_recv) = eventfd_recv {
+            session
+                .shared
+                .eventfd_loop
+                .set(tokio::spawn(session.clone().eventfd_loop(eventfd_recv)))
+                .unwrap();
+        }
 
         // uds read
         session
@@ -359,7 +451,12 @@ impl Session {
             .unwrap()
             .insert(id, stream.clone());
 
-        tracing::trace!("{} open stream {}", self.shared.name, id);
+        tracing::trace!(
+            "{} open stream {} proto {}",
+            self.shared.name,
+            id,
+            self.shared.proto_version
+        );
 
         Ok(stream)
     }
@@ -420,6 +517,12 @@ impl Session {
     }
 
     pub async fn wake_up_peer(&self) -> Result<(), Error> {
+        if matches!(
+            self.shared.negotiated_feature,
+            NegotiatedFeature::EventQueuePolling { .. }
+        ) {
+            return Ok(());
+        }
         if !self.shared.queue_manager.send_queue.mark_working() {
             return Ok(());
         }
@@ -427,13 +530,16 @@ impl Session {
             .stats
             .send_polling_event_count
             .fetch_add(1, Ordering::SeqCst);
+        if let Some(eventfd_send) = &self.shared.eventfd_send {
+            write_eventfd(eventfd_send.as_raw_fd())?;
+            return Ok(());
+        }
         _ = self
             .shared
             .send_tx
             .send(SendReady {
                 hdr: None,
-                body: POLLING_EVENT_WITH_VERSION[self.shared.communication_version as usize]
-                    .clone(),
+                body: POLLING_EVENT_WITH_VERSION[self.shared.msg_version as usize].clone(),
                 tx: oneshot::channel().0,
             })
             .await;
@@ -586,6 +692,80 @@ impl Session {
         }
     }
 
+    async fn polling_loop(self, interval: Duration) {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let shutdown_notified = self.shared.shutdown_notify.notified();
+        tokio::pin!(shutdown_notified);
+        loop {
+            match futures::future::select(std::pin::pin!(ticker.tick()), &mut shutdown_notified)
+                .await
+            {
+                Either::Left(_) => {
+                    if let Some(err) = self.drain_recv_queue().await {
+                        self.exit_err(err).await;
+                        return;
+                    }
+                }
+                Either::Right(_) => return,
+            }
+        }
+    }
+
+    async fn eventfd_loop(self, eventfd_recv: OwnedFd) {
+        let eventfd = match tokio::io::unix::AsyncFd::new(eventfd_recv) {
+            Ok(eventfd) => eventfd,
+            Err(err) => {
+                self.exit_err(err.into()).await;
+                return;
+            }
+        };
+        let shutdown_notified = self.shared.shutdown_notify.notified();
+        tokio::pin!(shutdown_notified);
+        loop {
+            match futures::future::select(
+                std::pin::pin!(eventfd.readable()),
+                &mut shutdown_notified,
+            )
+            .await
+            {
+                Either::Left((ready, _)) => {
+                    let mut ready = match ready {
+                        Ok(ready) => ready,
+                        Err(err) => {
+                            self.exit_err(err.into()).await;
+                            return;
+                        }
+                    };
+                    let mut drained = false;
+                    match ready.try_io(|inner| -> std::io::Result<()> {
+                        drained = drain_eventfd(inner.as_raw_fd())?;
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            self.exit_err(err.into()).await;
+                            return;
+                        }
+                        Err(_) => {}
+                    }
+                    if !drained {
+                        continue;
+                    }
+                    self.shared
+                        .stats
+                        .recv_polling_event_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    if let Some(err) = self.drain_recv_queue().await {
+                        self.exit_err(err).await;
+                        return;
+                    }
+                }
+                Either::Right(_) => return,
+            }
+        }
+    }
+
     /// Used to handle an error that is causing the session to terminate.
     async fn exit_err(&self, err: Error) {
         tracing::warn!("{} exit with error: {}", self.shared.name, err);
@@ -598,6 +778,22 @@ impl Session {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "legacy fallback failed after v4 initialization failed; v4 error: {v4_error}; fallback error: \
+     {fallback_error}"
+)]
+struct V4FallbackFailed {
+    #[source]
+    v4_error: anyhow::Error,
+    fallback_error: anyhow::Error,
+}
+
+fn is_v4_fallback_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<V4ClientInitError>()
+        .is_some_and(V4ClientInitError::is_network_or_protocol)
+}
+
 impl Session {
     pub async fn handle_events(&self, buf: &[u8]) -> (usize, usize, Option<Error>) {
         let mut consumed = 0;
@@ -608,8 +804,19 @@ impl Session {
             }
             let (n, required, stop, err) = match event_header.msg_type() {
                 EventType::TYPE_POLLING => {
-                    self.handle_polling(&event_header, &buf[consumed + HEADER_SIZE..])
-                        .await
+                    if matches!(
+                        self.shared.negotiated_feature,
+                        NegotiatedFeature::EventQueuePolling { .. } | NegotiatedFeature::EventFd
+                    ) {
+                        self.shared
+                            .stats
+                            .recv_polling_event_count
+                            .fetch_add(1, Ordering::SeqCst);
+                        (HEADER_SIZE, HEADER_SIZE, false, None)
+                    } else {
+                        self.handle_polling(&event_header, &buf[consumed + HEADER_SIZE..])
+                            .await
+                    }
                 }
                 EventType::TYPE_STREAM_CLOSE => {
                     self.handle_stream_close(&event_header, &buf[consumed + HEADER_SIZE..])
@@ -647,6 +854,15 @@ impl Session {
             .stats
             .recv_polling_event_count
             .fetch_add(1, Ordering::SeqCst);
+        (
+            HEADER_SIZE,
+            HEADER_SIZE,
+            false,
+            self.drain_recv_queue().await,
+        )
+    }
+
+    async fn drain_recv_queue(&self) -> Option<Error> {
         let mut _consumed_count = 0;
         let mut ret_err = None;
         loop {
@@ -674,7 +890,7 @@ impl Session {
                             self.shared.buffer_manager.recycle_buffers(slice);
                         }
                         Err(err) => {
-                            return (HEADER_SIZE, HEADER_SIZE, false, Some(err.into()));
+                            return Some(err.into());
                         }
                     };
                 } else {
@@ -687,7 +903,7 @@ impl Session {
                 break;
             }
         }
-        (HEADER_SIZE, HEADER_SIZE, false, ret_err)
+        ret_err
     }
 
     pub async fn handle_fallback_data(
@@ -702,8 +918,6 @@ impl Session {
             return (0, event_len, true, None);
         }
         assert!(payload_len >= fallback_data_header);
-        let mut data = vec![0u8; payload_len - fallback_data_header];
-        data.copy_from_slice(&buf[fallback_data_header..payload_len]);
         // fallback data layout: eventHeader | seqID | status | payload
         let seq_id = u32::from_be_bytes(buf[..4].try_into().unwrap());
         // now the first byte of status is streamState, and the other byte of status is undefined.
@@ -716,28 +930,29 @@ impl Session {
             status
         );
         self.open_circuit_breaker().await;
-        let mut fallback_slice = BufferSlice::new(None, &mut data, 0, false);
-        fallback_slice.write_index = data.len();
-        std::mem::forget(data);
         self.shared
             .stats
             .fallback_read_count
             .fetch_add(1, Ordering::SeqCst);
         match self.get_stream(seq_id, status).await {
-            Some(stream) => (
-                event_len,
-                HEADER_SIZE,
-                false,
-                self.handle_stream_message(
-                    stream,
-                    BufferSliceWrapper {
-                        fallback_slice: Some(fallback_slice),
-                        offset: 0,
-                    },
-                    status,
+            Some(stream) => {
+                let mut data = vec![0u8; payload_len - fallback_data_header];
+                data.copy_from_slice(&buf[fallback_data_header..payload_len]);
+                let mut fallback_slice = BufferSlice::new(None, &mut data, 0, false);
+                fallback_slice.write_index = data.len();
+                let wrapper = BufferSliceWrapper {
+                    fallback_slice: Some(fallback_slice),
+                    offset: 0,
+                };
+                // The wrapper now owns the allocation through the raw pointer in its slice.
+                std::mem::forget(data);
+                (
+                    event_len,
+                    HEADER_SIZE,
+                    false,
+                    self.handle_stream_message(stream, wrapper, status).err(),
                 )
-                .err(),
-            ),
+            }
             None => (event_len, HEADER_SIZE, false, None),
         }
     }
@@ -797,5 +1012,30 @@ impl Session {
         }
 
         stream.fill_data_to_read_buffer(wrapper)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::negotiation::{ERROR_VERSION_NOT_SUPPORTED, NegotiationError};
+
+    #[test]
+    fn v4_fallback_error_requires_typed_network_or_protocol_error() {
+        let network_or_protocol =
+            V4ClientInitError::network_or_protocol(anyhow!("EOF while reading negotiation"));
+        assert!(is_v4_fallback_error(&network_or_protocol));
+
+        let rejected = V4ClientInitError::rejected(NegotiationError {
+            code: ERROR_VERSION_NOT_SUPPORTED.to_owned(),
+            message: "protocol version is not supported".to_owned(),
+        });
+        assert!(!is_v4_fallback_error(&rejected));
+
+        let invalid_response = V4ClientInitError::invalid_response(anyhow!("invalid json"));
+        assert!(!is_v4_fallback_error(&invalid_response));
+
+        let untyped = anyhow!("v4 negotiation read protocol connection failed");
+        assert!(!is_v4_fallback_error(&untyped));
     }
 }

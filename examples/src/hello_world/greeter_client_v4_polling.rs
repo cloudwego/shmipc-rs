@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::os::unix::net::SocketAddr;
+use std::{os::unix::net::SocketAddr, time::Duration};
 
 use shmipc::{
+    config::Config,
     session::{SessionManager, SessionManagerConfig},
     transport::DefaultUnixConnect,
 };
@@ -25,14 +26,11 @@ async fn main() {
     let dir = std::env::current_dir().unwrap();
     let uds_path = SocketAddr::from_pathname(dir.join("../ipc_test.sock")).unwrap();
 
-    let mut conf = SessionManagerConfig::new();
-    conf.config_mut().mem_map_type = shmipc::consts::MemMapType::MemMapTypeMemFd;
-    conf.config_mut().share_memory_path_prefix = "/dev/shm/client.ipc.shm".to_string();
-    #[cfg(target_os = "macos")]
-    {
-        conf.config.share_memory_path_prefix = "/tmp/client.ipc.shm".to_string();
-        conf.config.queue_path = "/tmp/client.ipc.shm_queue".to_string();
-    }
+    // V4 event_queue_polling removes per-message wakeups. Both peers use the interval negotiated
+    // from this client request, so lower values reduce latency at the cost of more timer activity.
+    let mut config = Config::default().with_v4_event_queue_polling(Duration::from_micros(100));
+    config.share_memory_path_prefix = "/dev/shm/client.v4.polling.ipc.shm".to_owned();
+    let conf = SessionManagerConfig::new().with_config(config);
 
     let sm = SessionManager::new(conf, DefaultUnixConnect, uds_path)
         .await

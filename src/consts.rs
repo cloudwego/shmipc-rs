@@ -17,7 +17,8 @@ use std::time::Duration;
 use crate::{buffer::manager::BUFFER_HEADER_SIZE, config::SizePercentPair};
 
 pub const PROTO_VERSION: u8 = 2;
-pub const MAX_SUPPORT_PROTO_VERSION: u8 = 3;
+pub const MAX_LEGACY_PROTO_VERSION: u8 = 3;
+pub const MAX_SUPPORT_PROTO_VERSION: u8 = 4;
 pub const MAGIC_NUMBER: u16 = 0x7758;
 
 #[repr(u8)]
@@ -42,6 +43,7 @@ pub const BUFFER_PATH_SUFFIX: &str = "_buffer";
 
 pub const MEMFD_DATA_LEN: usize = 4;
 pub const MEMFD_COUNT: usize = 2;
+pub const MEMFD_COUNT_EVENTFD: usize = 4;
 
 pub const BUFER_PATH_SUFFIX: &str = "_buffer";
 pub const UNIX_NETWORK: &str = "unix";

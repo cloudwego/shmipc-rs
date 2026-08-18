@@ -121,6 +121,9 @@ impl SliceList {
             return None;
         };
         debug_assert_ne!(self.len, 0);
+        if self.write_slice == Some(front) {
+            self.write_slice = None;
+        }
         self.len -= 1;
         let front_ref = unsafe { front.as_mut() };
         self.front_slice = front_ref.next_slice;
@@ -214,6 +217,7 @@ impl BufferSlice {
         buffer_header.set_start(self.start);
 
         let Some(next_slice) = &self.next_slice else {
+            buffer_header.unlink_next();
             return;
         };
         unsafe {
@@ -221,16 +225,34 @@ impl BufferSlice {
         }
     }
 
-    pub fn reset(&mut self) {
+    fn reset_indices_and_link(&mut self) {
         if let Some(buffer_header) = &self.buffer_header {
             buffer_header.set_size(0);
             buffer_header.set_start(0);
-            buffer_header.clear_flag()
+            buffer_header.unlink_next();
         }
         self.start = 0;
         self.write_index = 0;
         self.read_index = 0;
         self.next_slice = None;
+    }
+
+    pub fn reset(&mut self) {
+        self.reset_for_recycle();
+    }
+
+    pub fn reset_for_recycle(&mut self) {
+        self.reset_indices_and_link();
+        if let Some(buffer_header) = &self.buffer_header {
+            buffer_header.clear_flag()
+        }
+    }
+
+    pub fn reset_for_reuse(&mut self) {
+        self.reset_indices_and_link();
+        if let Some(buffer_header) = &self.buffer_header {
+            buffer_header.set_in_used();
+        }
     }
 
     pub const fn size(&self) -> usize {
@@ -355,6 +377,14 @@ impl BufferHeader {
         unsafe {
             *(self.0.offset(NEXT_BUFFER_OFFSET as isize) as *mut u32) = next;
             *self.0.offset(BUFFER_FLAG_OFFSET as isize) |= HAS_NEXT_BUFFER_FLAG;
+        }
+    }
+
+    #[inline]
+    pub fn unlink_next(&self) {
+        unsafe {
+            *(self.0.offset(NEXT_BUFFER_OFFSET as isize) as *mut u32) = 0;
+            *self.0.offset(BUFFER_FLAG_OFFSET as isize) &= !HAS_NEXT_BUFFER_FLAG;
         }
     }
 
@@ -552,6 +582,7 @@ mod tests {
         l.push_back(BufferSlice::new(None, &mut [0; 1024], 0, false));
         assert_eq!(l.front(), l.back());
         assert_eq!(1, l.size());
+        l.write_slice = l.front_slice;
 
         l.push_back(BufferSlice::new(None, &mut [0; 1024], 0, false));
         assert_eq!(2, l.size());
@@ -560,6 +591,7 @@ mod tests {
         l.pop_front();
         assert_eq!(1, l.size());
         assert_eq!(l.front(), l.back());
+        assert!(l.write().is_none());
 
         l.pop_front();
         assert_eq!(0, l.size());

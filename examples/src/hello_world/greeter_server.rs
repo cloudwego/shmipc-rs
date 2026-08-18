@@ -25,6 +25,8 @@ async fn main() {
     let uds_path = binding.to_str().unwrap();
     _ = unlink(uds_path);
 
+    // A server using the default protocol config can accept legacy V2/V3 clients and V4 clients.
+    // V4 optional wakeup features are selected from the client negotiation request.
     let mut ln = Listener::new(
         DefaultUnixListen,
         SocketAddr::from_pathname(binding).unwrap(),
@@ -47,7 +49,10 @@ async fn main() {
 
 async fn handle_stream(mut stream: Stream) {
     loop {
-        let req_msg = match stream.read_bytes("client say hello world!!!".len()).await {
+        let req_msg = match stream
+            .read_exact_bytes("client say hello world!!!".len())
+            .await
+        {
             Ok(msg) => msg,
             Err(e) => {
                 eprintln!("failed to read msg, err: {e}");

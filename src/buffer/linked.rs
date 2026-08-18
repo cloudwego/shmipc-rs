@@ -18,8 +18,12 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use tokio::io::ReadBuf;
 
-use super::{BufferReader, BufferWriter, buf::Buf};
+use super::{
+    BufferReader, BufferWriter,
+    buf::{Buf, ShmBuf},
+};
 use crate::{
     buffer::{
         manager::BufferManager,
@@ -30,21 +34,130 @@ use crate::{
 };
 
 #[derive(Debug)]
+struct PinRegistry {
+    buffer_manager: Arc<BufferManager>,
+    /// Accessed only while the owning `LinkedBuffer` holds its `recycle_mux`.
+    slots: Vec<PinSlot>,
+}
+
+#[derive(Debug)]
+struct PinSlot {
+    key: usize,
+    state: Arc<SlicePinState>,
+}
+
+impl PinRegistry {
+    fn new(buffer_manager: Arc<BufferManager>) -> Self {
+        Self {
+            buffer_manager,
+            slots: Vec::new(),
+        }
+    }
+
+    fn acquire(&mut self, slice: &BufferSlice) -> PinLease {
+        let key = slice.data as usize;
+        let state = if let Some(slot) = self.slots.iter().find(|slot| slot.key == key) {
+            slot.state.clone()
+        } else {
+            let state = Arc::new(SlicePinState::new(self.buffer_manager.clone()));
+            self.slots.push(PinSlot {
+                key,
+                state: state.clone(),
+            });
+            state
+        };
+        PinLease { _state: state }
+    }
+
+    fn is_pinned(&self, slice: &BufferSlice) -> bool {
+        self.slots
+            .iter()
+            .find(|slot| slot.key == slice.data as usize)
+            .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
+    }
+
+    fn retire(&mut self, slice: BufferSlice) {
+        let key = slice.data as usize;
+        let state = self
+            .slots
+            .iter()
+            .position(|slot| slot.key == key)
+            .map(|idx| self.slots.swap_remove(idx).state);
+        if let Some(state) = state {
+            state.retire(slice);
+        } else {
+            reclaim_slice(&self.buffer_manager, slice);
+        }
+    }
+
+    fn abandon(&mut self, slice: &BufferSlice) {
+        let key = slice.data as usize;
+        let state = self
+            .slots
+            .iter()
+            .position(|slot| slot.key == key)
+            .map(|idx| self.slots.swap_remove(idx).state);
+        if let Some(state) = state {
+            debug_assert_eq!(Arc::strong_count(&state), 1);
+            debug_assert!(state.retired_slice.lock().unwrap().is_none());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SlicePinState {
+    buffer_manager: Arc<BufferManager>,
+    retired_slice: Mutex<Option<BufferSlice>>,
+}
+
+impl SlicePinState {
+    fn new(buffer_manager: Arc<BufferManager>) -> Self {
+        Self {
+            buffer_manager,
+            retired_slice: Mutex::new(None),
+        }
+    }
+
+    fn retire(self: Arc<Self>, slice: BufferSlice) {
+        if Arc::strong_count(&self) == 1 {
+            reclaim_slice(&self.buffer_manager, slice);
+            return;
+        }
+        let previous = self.retired_slice.lock().unwrap().replace(slice);
+        debug_assert!(previous.is_none());
+    }
+}
+
+impl Drop for SlicePinState {
+    fn drop(&mut self) {
+        if let Some(slice) = self.retired_slice.get_mut().unwrap().take() {
+            reclaim_slice(&self.buffer_manager, slice);
+        }
+    }
+}
+
+fn reclaim_slice(buffer_manager: &BufferManager, slice: BufferSlice) {
+    if slice.is_from_shm {
+        buffer_manager.recycle_buffer(slice);
+    } else {
+        unsafe {
+            _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
+        }
+    }
+}
+
+pub(crate) struct PinLease {
+    _state: Arc<SlicePinState>,
+}
+
+#[derive(Debug)]
 pub struct LinkedBuffer {
     slice_list: SliceList,
-    /// LinkedBuffer's `recycle()` will hold this lock
-    /// in most scenario(99.999..%), no competition on this mutex.
-    /// But when `stream.close()` called, at the meantime,
-    /// session receive data and find the stream is under status of close,
-    /// which will call LinkedBuffer's `recycle()` causing competition.
-    recycle_mux: Mutex<()>,
+    /// Serializes zero-copy lease acquisition and slice retirement with a concurrent stream close.
+    recycle_mux: Arc<Mutex<()>>,
     buffer_manager: Arc<BufferManager>,
-    /// Already read slices dropped by `read_bytes()` will be saved here instead of recycled
-    /// instantly. Slices inside will be recycled when `release_previous_read()` is called.
-    pinned_list: SliceList,
-    /// If `SliceList.front()` is pinned (initialized with false, be turned to true when
-    /// `read_bytes()` and `peek()`)
-    current_pinned: bool,
+    /// Tracks zero-copy readers and owns retired slices until the final reader is dropped.
+    pin_registry: PinRegistry,
     end_stream: bool,
     is_from_shm: bool,
     len: usize,
@@ -54,13 +167,13 @@ unsafe impl Send for LinkedBuffer {}
 unsafe impl Sync for LinkedBuffer {}
 
 impl LinkedBuffer {
-    pub const fn new(buffer_manager: Arc<BufferManager>) -> Self {
+    pub fn new(buffer_manager: Arc<BufferManager>) -> Self {
+        let pin_registry = PinRegistry::new(buffer_manager.clone());
         Self {
             slice_list: SliceList::new(),
-            recycle_mux: Mutex::new(()),
+            recycle_mux: Arc::new(Mutex::new(())),
             buffer_manager,
-            pinned_list: SliceList::new(),
-            current_pinned: false,
+            pin_registry,
             end_stream: false,
             is_from_shm: true,
             len: 0,
@@ -94,6 +207,12 @@ impl LinkedBuffer {
         _ = end_stream;
 
         if self.is_from_shm {
+            let unused_head = if self.slice_list.write().is_some_and(|s| s.next().is_some()) {
+                self.slice_list.split_from_write()
+            } else {
+                None
+            };
+
             let mut slice = self.slice_list.front();
             while let Some(s) = slice {
                 s.update();
@@ -102,22 +221,20 @@ impl LinkedBuffer {
                 }
                 slice = s.next();
             }
-            // recycle unused slice
-            if let Some(write_slice) = self.slice_list.write()
-                && write_slice.next().is_some()
-            {
-                let head = self.slice_list.split_from_write();
-                let mut slice = head;
-                while let Some(s) = slice {
-                    let next = unsafe { s.next_slice.map(|s| *Box::from_raw(s.as_ptr())) };
-                    self.buffer_manager.recycle_buffer(s);
-                    slice = next;
-                }
+
+            // Recycle slices that were allocated speculatively but never written.
+            let mut slice = unused_head;
+            while let Some(s) = slice {
+                let next = unsafe { s.next_slice.map(|s| *Box::from_raw(s.as_ptr())) };
+                self.buffer_manager.recycle_buffer(s);
+                slice = next;
             }
         }
     }
 
     pub fn append_buffer_slice(&mut self, slice: BufferSlice) {
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         if !slice.is_from_shm {
             self.is_from_shm = false;
         }
@@ -127,52 +244,61 @@ impl LinkedBuffer {
     }
 
     pub fn release_previous_read_and_reserve(&mut self) {
-        self.clean_pinned_list();
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         // try reserve space in long-stream mode for improving performance.
         // we could use read buffer as next write buffer to avoiding share memory allocate and
         // recycle.
         if self.len == 0 && self.slice_list.size() == 1 {
+            if self
+                .slice_list
+                .front()
+                .is_some_and(|slice| self.pin_registry.is_pinned(slice))
+            {
+                let slice = self.slice_list.pop_front().unwrap();
+                self.slice_list.write_slice = None;
+                self.pin_registry.retire(slice);
+                return;
+            }
             if self.slice_list.front().unwrap().is_from_shm {
-                self.slice_list.front_mut().unwrap().reset();
+                self.slice_list.front_mut().unwrap().reset_for_reuse();
             } else {
                 let slice = self.slice_list.pop_front().unwrap();
-                unsafe {
-                    _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
-                }
+                self.pin_registry.retire(slice);
             }
         }
     }
 
     pub fn recycle(&mut self) {
-        let _unused = self.recycle_mux.lock().unwrap();
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         while let Some(slice) = self.slice_list.pop_front() {
-            if slice.is_from_shm {
-                self.buffer_manager.recycle_buffer(slice);
-            } else {
-                unsafe {
-                    _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
-                }
-            }
+            self.pin_registry.retire(slice);
         }
         self.slice_list.write_slice = None;
         self.is_from_shm = true;
         self.end_stream = false;
-        self.current_pinned = false;
         self.len = 0;
     }
 
     pub fn clean(&mut self) {
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         while let Some(slice) = self.slice_list.pop_front() {
-            if !slice.is_from_shm {
-                unsafe {
-                    _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
+            if self.pin_registry.is_pinned(&slice) {
+                self.pin_registry.retire(slice);
+            } else {
+                self.pin_registry.abandon(&slice);
+                if !slice.is_from_shm {
+                    unsafe {
+                        _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
+                    }
                 }
             }
         }
         self.slice_list.write_slice = None;
         self.is_from_shm = true;
         self.end_stream = false;
-        self.current_pinned = false;
         self.len = 0;
     }
 
@@ -224,42 +350,100 @@ impl LinkedBuffer {
     }
 
     fn read_next_slice(&mut self) {
-        if let Some(slice) = self.slice_list.pop_front()
-            && slice.is_from_shm
-        {
-            if self.current_pinned {
-                self.pinned_list.push_back(slice);
-            } else {
-                self.buffer_manager.recycle_buffer(slice);
-            }
+        if let Some(slice) = self.slice_list.pop_front() {
+            self.pin_registry.retire(slice);
         }
-        self.current_pinned = false;
     }
 
-    fn clean_pinned_list(&mut self) {
-        if self.pinned_list.size() == 0 {
-            return;
+    pub(crate) fn read_available_into(
+        &mut self,
+        dst: &mut ReadBuf<'_>,
+        max_slices: usize,
+    ) -> Result<usize, Error> {
+        if dst.remaining() == 0 {
+            return Ok(0);
         }
-        self.current_pinned = false;
-        while self.pinned_list.size() > 0 {
-            if let Some(slice) = self.pinned_list.pop_front() {
-                if slice.is_from_shm {
-                    self.buffer_manager.recycle_buffer(slice);
-                } else {
-                    unsafe {
-                        _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
-                    }
+        assert!(max_slices > 0, "max_slices must be greater than zero");
+
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
+        if self.len == 0 {
+            return Err(Error::NotEnoughData);
+        }
+
+        while self.len > 0
+            && self
+                .slice_list
+                .front()
+                .is_some_and(|slice| slice.size() == 0)
+        {
+            self.read_next_slice();
+        }
+
+        let mut copied = 0;
+        let mut slices_read = 0;
+        while self.len > 0 && dst.remaining() > 0 && slices_read < max_slices {
+            let available = self
+                .slice_list
+                .front()
+                .map(BufferSlice::size)
+                .filter(|size| *size > 0)
+                .ok_or(Error::NotEnoughData)?;
+            let read_size = available.min(dst.remaining());
+            let data = self.slice_list.front_mut().unwrap().read(read_size);
+            dst.put_slice(data);
+            self.len -= read_size;
+            copied += read_size;
+
+            if read_size == available {
+                slices_read += 1;
+                if self.len > 0 {
+                    self.read_next_slice();
                 }
+            } else {
+                break;
             }
         }
+
+        debug_assert!(copied > 0);
+        Ok(copied)
     }
 }
 
 impl BufferReader for LinkedBuffer {
-    fn read_bytes(&mut self, mut size: usize) -> Result<Buf<'_>, Error> {
+    fn read_chunk(&mut self) -> Result<Buf<'_>, Error> {
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
+
+        while self
+            .slice_list
+            .front()
+            .is_some_and(|slice| slice.size() == 0)
+        {
+            self.read_next_slice();
+        }
+
+        let size = self
+            .slice_list
+            .front()
+            .map(BufferSlice::size)
+            .filter(|size| *size > 0)
+            .ok_or(Error::NotEnoughData)?;
+        if self.len < size {
+            return Err(Error::NotEnoughData);
+        }
+        let lease = self.pin_registry.acquire(self.slice_list.front().unwrap());
+        self.len -= size;
+        let bytes = self.slice_list.front_mut().unwrap().read(size);
+        Ok(Buf::Shm(ShmBuf::new(bytes, lease)))
+    }
+
+    fn read_exact_bytes(&mut self, mut size: usize) -> Result<Buf<'_>, Error> {
         if size == 0 {
             return Ok(Buf::Exm(Bytes::new()));
         }
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         if self.len < size {
             return Err(Error::NotEnoughData);
         }
@@ -276,11 +460,11 @@ impl BufferReader for LinkedBuffer {
         if let Some(slice) = self.slice_list.front_mut()
             && slice.size() >= size
         {
-            self.current_pinned = true;
+            let lease = self.pin_registry.acquire(slice);
             self.len -= size;
             // A workaround to avoid https://github.com/rust-lang/rust/issues/54663
             let bytes = self.slice_list.front_mut().unwrap().read(size);
-            return Ok(Buf::Shm(bytes));
+            return Ok(Buf::Shm(ShmBuf::new(bytes, lease)));
         }
         // slow path
         self.len -= size;
@@ -304,16 +488,19 @@ impl BufferReader for LinkedBuffer {
         if size == 0 {
             return Ok(Buf::Exm(Bytes::new()));
         }
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         if self.len < size {
             return Err(Error::NotEnoughData);
         }
 
         if let Some(slice) = self.slice_list.front_mut() {
+            let lease = self.pin_registry.acquire(slice);
             let read_bytes = slice.peek(size);
             if read_bytes.len() == size {
-                self.current_pinned = true;
-                return Ok(Buf::Shm(read_bytes));
+                return Ok(Buf::Shm(ShmBuf::new(read_bytes, lease)));
             }
+            drop(lease);
         }
 
         // slow path
@@ -331,6 +518,8 @@ impl BufferReader for LinkedBuffer {
     }
 
     fn discard(&mut self, mut size: usize) -> Result<usize, Error> {
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
         if self.len < size {
             return Err(Error::NotEnoughData);
         }
@@ -351,7 +540,8 @@ impl BufferReader for LinkedBuffer {
     }
 
     fn release_previous_read(&mut self) {
-        self.clean_pinned_list();
+        let recycle_mux = self.recycle_mux.clone();
+        let _unused = recycle_mux.lock().unwrap();
 
         if self.slice_list.size() == 0 {
             return;
@@ -360,8 +550,8 @@ impl BufferReader for LinkedBuffer {
         if self.slice_list.front().unwrap().size() == 0
             && self.slice_list.front_slice == self.slice_list.write_slice
         {
-            self.buffer_manager
-                .recycle_buffer(self.slice_list.pop_front().unwrap());
+            let slice = self.slice_list.pop_front().unwrap();
+            self.pin_registry.retire(slice);
             self.slice_list.write_slice = None;
         }
     }
@@ -445,16 +635,18 @@ impl BufferWriter for LinkedBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{ptr::NonNull, sync::Arc};
 
     use memmap2::MmapOptions;
     use rand::Rng;
+    use tokio::io::ReadBuf;
 
     use super::{BufferReader, LinkedBuffer};
     use crate::{
         buffer::{BufferWriter, manager::BufferManager, slice::BufferSlice},
         config::SizePercentPair,
         consts::DEFAULT_SINGLE_BUFFER_SIZE,
+        error::Error,
     };
 
     fn init_shm() -> BufferManager {
@@ -494,6 +686,28 @@ mod tests {
         l
     }
 
+    fn fallback_slice(data: &[u8]) -> BufferSlice {
+        let mut owned = Vec::with_capacity(data.len());
+        owned.extend_from_slice(data);
+        let slice = BufferSlice {
+            buffer_header: None,
+            data: owned.as_mut_ptr(),
+            cap: owned.capacity() as u32,
+            start: 0,
+            offset_in_shm: 0,
+            read_index: 0,
+            write_index: owned.len(),
+            is_from_shm: false,
+            next_slice: None::<NonNull<BufferSlice>>,
+        };
+        std::mem::forget(owned);
+        slice
+    }
+
+    fn append_fallback(buffer: &mut LinkedBuffer, data: &[u8]) {
+        buffer.append_buffer_slice(fallback_slice(data));
+    }
+
     #[test]
     fn test_linked_buffer_release_previous_read() {
         let bm = Arc::new(init_shm());
@@ -506,22 +720,85 @@ mod tests {
         buf.done(true);
 
         for _ in 0..slice_num / 2 {
-            let r = buf.read_bytes(4096).unwrap();
+            let r = buf.read_exact_bytes(4096).unwrap();
             assert_eq!(4096, r.len());
         }
-        assert_eq!(slice_num / 2 - 1, buf.pinned_list.size());
+        {
+            let slots = &buf.pin_registry.slots;
+            let state = &slots.first().unwrap().state;
+            assert_eq!(Arc::strong_count(state), 1);
+            assert!(state.retired_slice.lock().unwrap().is_none());
+        }
         _ = buf.discard(buf.len());
 
         buf.release_previous_read_and_reserve();
-        assert_eq!(0, buf.pinned_list.size());
         assert_eq!(0, buf.len());
         // the last slice shouldn't release
         assert_eq!(1, buf.slice_list.size());
         assert!(buf.slice_list.write_slice.is_some());
+        assert!(
+            buf.slice_list
+                .front()
+                .unwrap()
+                .buffer_header
+                .as_ref()
+                .unwrap()
+                .is_in_used()
+        );
 
         buf.release_previous_read();
         assert_eq!(0, buf.slice_list.size());
         assert!(buf.slice_list.write_slice.is_none());
+    }
+
+    #[test]
+    fn recycle_waits_for_last_zero_copy_lease() {
+        let manager = Arc::new(init_shm());
+        let slice = manager.alloc_shm_buffer(1024).unwrap();
+        let mut buffer = new_linked_buffer_with_slice(manager.clone(), slice);
+        let data = vec![7u8; 1024];
+        buffer.write_bytes(&data).unwrap();
+        buffer.done(false);
+
+        let leased = buffer.read_exact_bytes(data.len()).unwrap().into_bytes();
+        let leased_clone = leased.clone();
+        buffer.recycle();
+
+        assert!(!manager.check_buffer_returned());
+        assert_eq!(&leased[..], data.as_slice());
+        drop(leased);
+        assert!(!manager.check_buffer_returned());
+        assert_eq!(&leased_clone[..], data.as_slice());
+
+        drop(leased_clone);
+        assert!(manager.check_buffer_returned());
+    }
+
+    #[test]
+    fn active_lease_does_not_delay_unrelated_slices() {
+        let manager = Arc::new(init_shm());
+        let first = manager.alloc_shm_buffer(1024).unwrap();
+        let first_capacity = first.capacity();
+        let mut buffer = new_linked_buffer_with_slice(manager.clone(), first);
+        buffer
+            .write_bytes(&vec![9u8; first_capacity + 1024])
+            .unwrap();
+        buffer.done(false);
+        let remaining_after_write = manager.remain_size();
+
+        let leased = buffer
+            .read_exact_bytes(first_capacity)
+            .unwrap()
+            .into_bytes();
+        buffer.discard(buffer.len()).unwrap();
+        buffer.release_previous_read();
+
+        assert!(buffer.pin_registry.slots.is_empty());
+        assert!(manager.remain_size() > remaining_after_write);
+        assert!(!manager.check_buffer_returned());
+
+        drop(leased);
+        assert!(manager.check_buffer_returned());
     }
 
     #[test]
@@ -556,11 +833,14 @@ mod tests {
         let all = data_size * mock_data_array.len();
         assert_eq!(all, writer.len());
 
-        for (i, array) in mock_data_array.into_iter().enumerate() {
-            assert_eq!(all - i * data_size, writer.len());
-            let get = writer.read_bytes(data_size).unwrap();
-            assert_eq!(array, get);
+        let expected = mock_data_array.concat();
+        let mut actual = Vec::with_capacity(all);
+        while !writer.is_empty() {
+            let chunk = writer.read_chunk().unwrap();
+            assert!(!chunk.is_empty());
+            actual.extend_from_slice(&chunk);
         }
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -612,8 +892,24 @@ mod tests {
         buffer.write_bytes(&mock_data[..]).unwrap();
         buffer.done(true);
         assert_eq!(2, buffer.slice_list.size());
-        let get_bytes = buffer.read_bytes(mock_data_size).unwrap();
+        let get_bytes = buffer.read_exact_bytes(mock_data_size).unwrap();
         assert_eq!(mock_data, get_bytes);
+    }
+
+    #[test]
+    fn test_linked_buffer_done_clears_recycled_tail_link() {
+        let bm = Arc::new(init_shm());
+
+        let mut buffer = new_linked_buffer(bm, (64 + 64 + 64) * 1024);
+        let mock_data = vec![0u8; 128 * 1024];
+
+        buffer.write_bytes(&mock_data).unwrap();
+        buffer.done(true);
+
+        assert_eq!(2, buffer.slice_list.size());
+        let last_valid = buffer.slice_list.write().unwrap();
+        assert!(last_valid.next().is_none());
+        assert!(!last_valid.buffer_header.as_ref().unwrap().has_next());
     }
 
     fn new_linked_buffer(manager: Arc<BufferManager>, size: u32) -> LinkedBuffer {
@@ -624,7 +920,157 @@ mod tests {
     }
 
     #[test]
-    fn test_linked_buffer_read_bytes() {
+    fn read_chunk_returns_one_non_empty_slice() {
+        let manager = Arc::new(init_shm());
+        let first = manager.alloc_shm_buffer(1024).unwrap();
+        let first_capacity = first.capacity();
+        let mut buffer = new_linked_buffer_with_slice(manager, first);
+
+        let first_data = vec![1u8; first_capacity];
+        let second_data = vec![2u8; 128];
+        buffer.write_bytes(&first_data).unwrap();
+        buffer.write_bytes(&second_data).unwrap();
+        buffer.done(false);
+
+        let first_chunk = buffer.read_chunk().unwrap();
+        assert_eq!(&first_chunk[..], first_data);
+        drop(first_chunk);
+
+        // The exhausted first slice remains at the front until the next read. `read_chunk` must
+        // retire it and return the next non-empty slice instead of reporting an empty read.
+        let second_chunk = buffer.read_chunk().unwrap();
+        assert_eq!(&second_chunk[..], second_data);
+        drop(second_chunk);
+
+        assert!(buffer.is_empty());
+        assert!(matches!(buffer.read_chunk(), Err(Error::NotEnoughData)));
+        assert_eq!(buffer.slice_list.size(), 0);
+        assert!(buffer.slice_list.write_slice.is_none());
+
+        let rewritten = [3u8; 32];
+        buffer.write_bytes(&rewritten).unwrap();
+        let chunk = buffer.read_chunk().unwrap();
+        assert_eq!(&chunk[..], rewritten);
+    }
+
+    #[test]
+    fn read_available_into_copies_across_slices_without_leases() {
+        let manager = Arc::new(init_shm());
+        let mut buffer = LinkedBuffer::new(manager);
+        append_fallback(&mut buffer, b"ab");
+        append_fallback(&mut buffer, b"cde");
+        append_fallback(&mut buffer, b"fghi");
+
+        let mut first = [0; 4];
+        let mut dst = ReadBuf::new(&mut first);
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 4);
+        assert_eq!(dst.filled(), b"abcd");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer.slice_list.size(), 2);
+        assert!(buffer.pin_registry.slots.is_empty());
+
+        let mut second = [0; 8];
+        let mut dst = ReadBuf::new(&mut second);
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 5);
+        assert_eq!(dst.filled(), b"efghi");
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.slice_list.size(), 1);
+        assert_eq!(buffer.slice_list.front().unwrap().size(), 0);
+        assert!(buffer.pin_registry.slots.is_empty());
+
+        buffer.clean();
+    }
+
+    #[test]
+    fn read_available_into_limits_slices_per_call() {
+        let manager = Arc::new(init_shm());
+        let mut buffer = LinkedBuffer::new(manager);
+        for value in 0..65u8 {
+            append_fallback(&mut buffer, &[value]);
+        }
+
+        let mut output = [0; 65];
+        let mut dst = ReadBuf::new(&mut output);
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 64);
+        assert_eq!(dst.filled(), &(0..64u8).collect::<Vec<_>>());
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.slice_list.size(), 1);
+
+        assert_eq!(buffer.read_available_into(&mut dst, 64).unwrap(), 1);
+        assert_eq!(dst.filled(), &(0..65u8).collect::<Vec<_>>());
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.slice_list.size(), 1);
+
+        buffer.clean();
+    }
+
+    #[test]
+    fn read_available_into_handles_empty_destination_and_buffer() {
+        let manager = Arc::new(init_shm());
+        let mut buffer = LinkedBuffer::new(manager);
+
+        let mut empty = [];
+        let mut empty_dst = ReadBuf::new(&mut empty);
+        assert_eq!(buffer.read_available_into(&mut empty_dst, 64).unwrap(), 0);
+
+        let mut output = [0; 1];
+        let mut dst = ReadBuf::new(&mut output);
+        assert!(matches!(
+            buffer.read_available_into(&mut dst, 64),
+            Err(Error::NotEnoughData)
+        ));
+    }
+
+    #[test]
+    fn read_available_into_preserves_last_shm_slice_for_reuse() {
+        let manager = Arc::new(init_shm());
+        let slice = manager.alloc_shm_buffer(1024).unwrap();
+        let mut buffer = new_linked_buffer_with_slice(manager, slice);
+        let data = vec![7u8; 256];
+        buffer.write_bytes(&data).unwrap();
+        buffer.done(false);
+
+        let mut output = vec![0; data.len()];
+        let mut dst = ReadBuf::new(&mut output);
+        assert_eq!(
+            buffer.read_available_into(&mut dst, 64).unwrap(),
+            data.len()
+        );
+        assert_eq!(dst.filled(), data);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.slice_list.size(), 1);
+        assert!(buffer.pin_registry.slots.is_empty());
+
+        buffer.release_previous_read_and_reserve();
+        assert_eq!(buffer.slice_list.size(), 1);
+        assert!(buffer.slice_list.write_slice.is_some());
+        assert_eq!(buffer.slice_list.front().unwrap().read_index, 0);
+        assert_eq!(buffer.slice_list.front().unwrap().write_index, 0);
+
+        buffer.clean();
+    }
+
+    #[test]
+    fn read_exact_bytes_is_atomic_when_data_is_insufficient() {
+        let manager = Arc::new(init_shm());
+        let first = manager.alloc_shm_buffer(1024).unwrap();
+        let mut buffer = new_linked_buffer_with_slice(manager, first);
+        let data = vec![3u8; 256];
+        buffer.write_bytes(&data).unwrap();
+        buffer.done(false);
+
+        assert!(matches!(
+            buffer.read_exact_bytes(data.len() + 1),
+            Err(Error::NotEnoughData)
+        ));
+        assert_eq!(buffer.len(), data.len());
+
+        let exact = buffer.read_exact_bytes(data.len()).unwrap();
+        assert_eq!(&exact[..], data);
+    }
+
+    #[test]
+    fn test_linked_buffer_read_exact_bytes() {
         let manager = Arc::new(init_shm());
 
         let create_buffer_writer = || {
@@ -655,7 +1101,7 @@ mod tests {
                 // do nothing
                 _ = buf.peek(one_read_size);
 
-                let read_data = buf.read_bytes(one_read_size).unwrap();
+                let read_data = buf.read_exact_bytes(one_read_size).unwrap();
                 if read_data.is_empty() {
                     assert_eq!(one_read_size, 0);
                 } else {
@@ -664,7 +1110,7 @@ mod tests {
                 read += one_read_size;
             }
             assert_eq!(1 << 21, read);
-            buf.read_bytes(0).unwrap();
+            buf.read_exact_bytes(0).unwrap();
             buf.release_previous_read();
         };
 
@@ -717,10 +1163,10 @@ mod tests {
 
         writer.done(false);
 
-        let get_str = writer.read_bytes(str.len()).unwrap();
+        let get_str = writer.read_exact_bytes(str.len()).unwrap();
         assert_eq!(str, std::str::from_utf8(&get_str).unwrap());
 
-        let get_bytes = writer.read_bytes(str.len()).unwrap();
+        let get_bytes = writer.read_exact_bytes(str.len()).unwrap();
         assert_eq!(str.as_bytes(), &get_bytes[..]);
 
         let mut writer = (create_buffer_writer.clone())();
@@ -754,7 +1200,7 @@ mod tests {
         let mut remain = writer.len();
         for _ in 0..MSG_NUM {
             remain -= ONE_MSG_SIZE;
-            let get_data = writer.read_bytes(1024).unwrap();
+            let get_data = writer.read_exact_bytes(1024).unwrap();
             assert_eq!(ONE_MSG_SIZE, get_data.len());
             assert_eq!(remain, writer.len());
         }
@@ -770,13 +1216,13 @@ mod tests {
         loop {
             let remain_len = writer.len();
             if remain_len > read_size {
-                let r = writer.read_bytes(read_size).unwrap();
+                let r = writer.read_exact_bytes(read_size).unwrap();
                 for j in 0..r.len() {
                     assert_eq!(count as u8, r[j]);
                     count += 1;
                 }
             } else if remain_len > 0 {
-                let r = writer.read_bytes(writer.len()).unwrap();
+                let r = writer.read_exact_bytes(writer.len()).unwrap();
                 for j in 0..r.len() {
                     assert_eq!(count as u8, r[j]);
                     count += 1;

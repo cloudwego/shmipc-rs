@@ -28,7 +28,7 @@ use nix::{
     unistd::{read, write},
 };
 
-use crate::consts::MEMFD_COUNT;
+use crate::consts::MEMFD_COUNT_EVENTFD;
 
 pub(crate) fn block_read_full(conn_fd: RawFd, data: &mut [u8]) -> Result<(), anyhow::Error> {
     let mut read_size = 0;
@@ -81,7 +81,10 @@ pub(crate) fn send_fd(conn_fd: RawFd, fds: &[RawFd]) -> Result<(), anyhow::Error
     .map(|_| ())?)
 }
 
-pub(crate) fn block_read_out_of_bound_for_fd(conn_fd: RawFd) -> Result<Vec<RawFd>, anyhow::Error> {
+pub(crate) fn block_read_out_of_bound_for_fd(
+    conn_fd: RawFd,
+    expected_fd_count: usize,
+) -> Result<Vec<RawFd>, anyhow::Error> {
     let mut iov = [IoSliceMut::new(&mut [0u8; 0])];
 
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(conn_fd) };
@@ -90,7 +93,7 @@ pub(crate) fn block_read_out_of_bound_for_fd(conn_fd: RawFd) -> Result<Vec<RawFd
     if sock_type != nix::sys::socket::SockType::Datagram {
         iov[0] = IoSliceMut::new(&mut buf);
     }
-    let mut cmsg_buffer = cmsg_space!([RawFd; MEMFD_COUNT]);
+    let mut cmsg_buffer = cmsg_space!([RawFd; MEMFD_COUNT_EVENTFD]);
 
     let recv_msg = recvmsg::<()>(
         conn_fd,
@@ -103,6 +106,17 @@ pub(crate) fn block_read_out_of_bound_for_fd(conn_fd: RawFd) -> Result<Vec<RawFd
 
     if let Some(msgs) = recv_msg.cmsgs()?.next() {
         if let ControlMessageOwned::ScmRights(fds) = msgs {
+            if fds.len() < expected_fd_count {
+                let got = fds.len();
+                for fd in fds {
+                    let _ = nix::unistd::close(fd);
+                }
+                return Err(anyhow!(
+                    "the number of fd received is wrong, expected at least {}, got {}",
+                    expected_fd_count,
+                    got
+                ));
+            }
             Ok(fds)
         } else {
             Err(anyhow!(
@@ -112,5 +126,33 @@ pub(crate) fn block_read_out_of_bound_for_fd(conn_fd: RawFd) -> Result<Vec<RawFd
         }
     } else {
         Err(anyhow!("parse socket control message ret is nil"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::File,
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
+    use super::{block_read_out_of_bound_for_fd, send_fd};
+    use crate::consts::MEMFD_COUNT_EVENTFD;
+
+    #[test]
+    fn recv_fd_rejects_insufficient_fd_count() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let file_a = File::open("/dev/null").unwrap();
+        let file_b = File::open("/dev/null").unwrap();
+
+        send_fd(
+            sender.as_raw_fd(),
+            &[file_a.as_raw_fd(), file_b.as_raw_fd()],
+        )
+        .unwrap();
+        let err =
+            block_read_out_of_bound_for_fd(receiver.as_raw_fd(), MEMFD_COUNT_EVENTFD).unwrap_err();
+
+        assert!(err.to_string().contains("expected at least 4, got 2"));
     }
 }

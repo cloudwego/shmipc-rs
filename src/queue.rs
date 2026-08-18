@@ -14,15 +14,15 @@
 
 use std::{
     ffi::CString,
-    fs::{self, File, OpenOptions, Permissions},
+    fs::{self, OpenOptions, Permissions},
     os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+        fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd},
         unix::prelude::PermissionsExt,
     },
     path::Path,
     sync::{
         Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicI64, AtomicU32, Ordering},
     },
 };
 
@@ -48,10 +48,52 @@ pub struct QueueManager {
     mmap_map_type: MemMapType,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueLayout {
+    Legacy,
+    Aligned,
+}
+
+impl QueueLayout {
+    pub(crate) const fn for_protocol_version(version: u8) -> Self {
+        if version >= 4 || cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
+            Self::Aligned
+        } else {
+            Self::Legacy
+        }
+    }
+
+    const fn working_flag_offset(self) -> isize {
+        match self {
+            Self::Legacy => 20,
+            Self::Aligned => 4,
+        }
+    }
+
+    const fn head_offset(self) -> isize {
+        match self {
+            Self::Legacy => 4,
+            Self::Aligned => 8,
+        }
+    }
+
+    const fn tail_offset(self) -> isize {
+        match self {
+            Self::Legacy => 12,
+            Self::Aligned => 16,
+        }
+    }
+}
+
 impl QueueManager {
-    pub fn create_with_memfd(queue_path_name: &str, queue_cap: u32) -> Result<Self, anyhow::Error> {
+    pub fn create_with_memfd(
+        queue_path_name: &str,
+        queue_cap: u32,
+        proto_version: u8,
+    ) -> Result<Self, anyhow::Error> {
         #[cfg(target_os = "linux")]
         {
+            let layout = QueueLayout::for_protocol_version(proto_version);
             let memfd = nix::sys::memfd::memfd_create(
                 CString::new(format!("shmipc{}", queue_path_name))
                     .expect("CString::new failed")
@@ -72,10 +114,11 @@ impl QueueManager {
 
             Ok(Self {
                 path: queue_path_name.to_owned(),
-                send_queue: Queue::create_from_bytes(mem.as_mut_ptr(), queue_cap),
+                send_queue: Queue::create_from_bytes(mem.as_mut_ptr(), queue_cap, layout),
                 recv_queue: Queue::create_from_bytes(
                     unsafe { mem.as_mut_ptr().add(mem_size / 2) },
                     queue_cap,
+                    layout,
                 ),
                 mem,
                 mmap_map_type: MemMapType::MemMapTypeMemFd,
@@ -88,7 +131,12 @@ impl QueueManager {
         }
     }
 
-    pub fn create_with_file(shm_path: &str, queue_cap: u32) -> Result<Self, anyhow::Error> {
+    pub fn create_with_file(
+        shm_path: &str,
+        queue_cap: u32,
+        proto_version: u8,
+    ) -> Result<Self, anyhow::Error> {
+        let layout = QueueLayout::for_protocol_version(proto_version);
         // ignore mkdir error
         let path = Path::new(shm_path);
         _ = fs::create_dir_all(path.parent().unwrap_or(Path::new("/")));
@@ -123,10 +171,11 @@ impl QueueManager {
 
         Ok(Self {
             path: shm_path.to_owned(),
-            send_queue: Queue::create_from_bytes(mem.as_mut_ptr(), queue_cap),
+            send_queue: Queue::create_from_bytes(mem.as_mut_ptr(), queue_cap, layout),
             recv_queue: Queue::create_from_bytes(
                 unsafe { mem.as_mut_ptr().add(mem_size / 2) },
                 queue_cap,
+                layout,
             ),
             mem,
             mmap_map_type: MemMapType::MemMapTypeDevShmFile,
@@ -134,14 +183,22 @@ impl QueueManager {
         })
     }
 
-    pub fn mapping_with_memfd(queue_path_name: &str, memfd: RawFd) -> Result<Self, anyhow::Error> {
-        let file = unsafe { File::from_raw_fd(memfd) };
-        let fi = file.metadata()?;
+    pub fn mapping_with_memfd(
+        queue_path_name: &str,
+        memfd: RawFd,
+        proto_version: u8,
+    ) -> Result<Self, anyhow::Error> {
+        let layout = QueueLayout::for_protocol_version(proto_version);
+        let file_stat = nix::sys::stat::fstat(unsafe { BorrowedFd::borrow_raw(memfd) })?;
 
-        let mapping_size = fi.len();
-        #[cfg(target_arch = "aarch64")]
-        // a queueManager have two queue, a queue's head and tail should align to 8 byte boundary
-        if mapping_size % 16 != 0 {
+        if file_stat.st_size < 0 {
+            return Err(anyhow!(
+                "invalid queue share memory size: {}",
+                file_stat.st_size
+            ));
+        }
+        let mapping_size = file_stat.st_size as u64;
+        if layout == QueueLayout::Aligned && !mapping_size.is_multiple_of(16) {
             return Err(anyhow!(
                 "the memory size of queue should be a multiple of 16"
             ));
@@ -154,25 +211,25 @@ impl QueueManager {
         };
         Ok(Self {
             path: queue_path_name.to_owned(),
-            send_queue: Queue::mapping_from_bytes(unsafe {
-                mem.as_mut_ptr().offset((mapping_size / 2) as isize)
-            }),
-            recv_queue: Queue::mapping_from_bytes(mem.as_mut_ptr()),
+            send_queue: Queue::mapping_from_bytes(
+                unsafe { mem.as_mut_ptr().offset((mapping_size / 2) as isize) },
+                layout,
+            ),
+            recv_queue: Queue::mapping_from_bytes(mem.as_mut_ptr(), layout),
             mem,
             mmap_map_type: MemMapType::MemMapTypeMemFd,
             memfd,
         })
     }
 
-    pub fn mapping_with_file(shm_path: &str) -> Result<Self, anyhow::Error> {
+    pub fn mapping_with_file(shm_path: &str, proto_version: u8) -> Result<Self, anyhow::Error> {
+        let layout = QueueLayout::for_protocol_version(proto_version);
         let file = OpenOptions::new().read(true).write(true).open(shm_path)?;
         file.set_permissions(Permissions::from_mode(0o777))?;
         let fi = file.metadata()?;
 
         let mapping_size = fi.len();
-        #[cfg(target_arch = "aarch64")]
-        // a queueManager have two queue, a queue's head and tail should align to 8 byte boundary
-        if mapping_size % 16 != 0 {
+        if layout == QueueLayout::Aligned && !mapping_size.is_multiple_of(16) {
             return Err(anyhow!(
                 "the memory size of queue should be a multiple of 16"
             ));
@@ -185,10 +242,11 @@ impl QueueManager {
         };
         Ok(Self {
             path: shm_path.to_owned(),
-            send_queue: Queue::mapping_from_bytes(unsafe {
-                mem.as_mut_ptr().offset((mapping_size / 2) as isize)
-            }),
-            recv_queue: Queue::mapping_from_bytes(mem.as_mut_ptr()),
+            send_queue: Queue::mapping_from_bytes(
+                unsafe { mem.as_mut_ptr().offset((mapping_size / 2) as isize) },
+                layout,
+            ),
+            recv_queue: Queue::mapping_from_bytes(mem.as_mut_ptr(), layout),
             mem,
             mmap_map_type: MemMapType::MemMapTypeDevShmFile,
             memfd: 0,
@@ -224,6 +282,7 @@ pub struct Queue {
     #[allow(dead_code)]
     len: usize,
     lock: Mutex<()>,
+    layout: QueueLayout,
 }
 
 unsafe impl Send for Queue {}
@@ -236,46 +295,29 @@ pub struct QueueElement {
 }
 
 impl Queue {
-    pub fn create_from_bytes(data: *mut u8, cap: u32) -> Self {
+    pub fn create_from_bytes(data: *mut u8, cap: u32, layout: QueueLayout) -> Self {
         unsafe { *(data as *mut u32) = cap };
-        let q = Self::mapping_from_bytes(data);
-        unsafe {
-            // Due to the previous shmipc specification, the head and tail of the queue is not align
-            // to 8 byte boundary
-            q.head.write_unaligned(0);
-            q.tail.write_unaligned(0);
-            (*q.working_flag).store(0, Ordering::SeqCst);
-        }
+        let q = Self::mapping_from_bytes(data, layout);
+        q.store_head(0);
+        q.store_tail(0);
+        unsafe { (*q.working_flag).store(0, Ordering::SeqCst) };
         q
     }
 
-    pub fn mapping_from_bytes(data: *mut u8) -> Self {
+    pub fn mapping_from_bytes(data: *mut u8, layout: QueueLayout) -> Self {
         let cap = unsafe { *(data as *mut u32) };
         let queue_start_offset = QUEUE_HEADER_LENGTH;
         let queue_end_offset = QUEUE_HEADER_LENGTH + QUEUE_ELEMENT_LEN * cap as usize;
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            Queue {
-                cap: cap as i64,
-                working_flag: data.offset(4) as *const AtomicU32,
-                head: data.offset(8) as *mut i64,
-                tail: data.offset(16) as *mut i64,
-                queue_bytes_on_memory: data.offset(queue_start_offset as isize) as *const u8,
-                len: queue_end_offset - queue_start_offset,
-                lock: Mutex::new(()),
-            }
-        }
-        // TODO: unaligned head and tail
-        #[cfg(not(target_arch = "aarch64"))]
         unsafe {
             Self {
                 cap: cap as i64,
-                working_flag: data.offset(20) as *const AtomicU32,
-                head: data.offset(4) as *mut i64,
-                tail: data.offset(12) as *mut i64,
+                working_flag: data.offset(layout.working_flag_offset()) as *const AtomicU32,
+                head: data.offset(layout.head_offset()) as *mut i64,
+                tail: data.offset(layout.tail_offset()) as *mut i64,
                 queue_bytes_on_memory: data.add(queue_start_offset) as *const u8,
                 len: queue_end_offset - queue_start_offset,
                 lock: Mutex::new(()),
+                layout,
             }
         }
     }
@@ -283,27 +325,27 @@ impl Queue {
     pub fn put(&self, element: QueueElement) -> Result<(), Error> {
         let _tail_lock = self.lock.lock().unwrap();
         unsafe {
-            if self.tail.read_unaligned() - self.head.read_unaligned() >= self.cap {
+            let tail = self.load_tail();
+            if tail - self.load_head() >= self.cap {
                 return Err(Error::QueueFull);
             }
-            let queue_offset =
-                (self.tail.read_unaligned() % self.cap) as isize * QUEUE_ELEMENT_LEN as isize;
+            let queue_offset = (tail % self.cap) as isize * QUEUE_ELEMENT_LEN as isize;
             *(self.queue_bytes_on_memory.offset(queue_offset) as *mut u32) = element.seq_id;
             *(self.queue_bytes_on_memory.offset(queue_offset + 4) as *mut u32) =
                 element.offset_in_shm_buf;
             *(self.queue_bytes_on_memory.offset(queue_offset + 8) as *mut u32) = element.status;
-            self.tail.write_unaligned(self.tail.read_unaligned() + 1);
+            self.store_tail(tail + 1);
         };
         Ok(())
     }
 
     pub fn pop(&self) -> Result<QueueElement, Error> {
         unsafe {
-            if self.head.read_unaligned() >= self.tail.read_unaligned() {
+            let head = self.load_head();
+            if head >= self.load_tail() {
                 return Err(Error::QueueEmpty);
             }
-            let queue_offset =
-                (self.head.read_unaligned() % self.cap) as isize * QUEUE_ELEMENT_LEN as isize;
+            let queue_offset = (head % self.cap) as isize * QUEUE_ELEMENT_LEN as isize;
             let element = QueueElement {
                 seq_id: *(self.queue_bytes_on_memory.offset(queue_offset) as *const u32),
                 offset_in_shm_buf: *(self.queue_bytes_on_memory.offset(queue_offset + 4)
@@ -311,23 +353,23 @@ impl Queue {
                 status: *(self.queue_bytes_on_memory.offset(queue_offset + 8) as *const u32),
             };
 
-            self.head.write_unaligned(self.head.read_unaligned() + 1);
+            self.store_head(head + 1);
             Ok(element)
         }
     }
 
     #[allow(unused)]
-    pub const fn is_full(&self) -> bool {
+    pub fn is_full(&self) -> bool {
         self.size() == self.cap
     }
 
     #[allow(unused)]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.size() == 0
     }
 
-    pub const fn size(&self) -> i64 {
-        unsafe { self.tail.read_unaligned() - self.head.read_unaligned() }
+    pub fn size(&self) -> i64 {
+        self.load_tail() - self.load_head()
     }
 
     #[allow(unused)]
@@ -352,6 +394,41 @@ impl Queue {
         }
         false
     }
+
+    fn load_head(&self) -> i64 {
+        self.load_position(self.head)
+    }
+
+    fn load_tail(&self) -> i64 {
+        self.load_position(self.tail)
+    }
+
+    fn store_head(&self, value: i64) {
+        self.store_position(self.head, value);
+    }
+
+    fn store_tail(&self, value: i64) {
+        self.store_position(self.tail, value);
+    }
+
+    fn load_position(&self, ptr: *mut i64) -> i64 {
+        if self.layout == QueueLayout::Aligned {
+            // SAFETY: QueueLayout::Aligned places head/tail at 8-byte aligned offsets.
+            // Acquire pairs with the peer's Release store that publishes queue data/capacity.
+            unsafe { (&*(ptr as *const AtomicI64)).load(Ordering::Acquire) }
+        } else {
+            unsafe { ptr.read_unaligned() }
+        }
+    }
+
+    fn store_position(&self, ptr: *mut i64, value: i64) {
+        if self.layout == QueueLayout::Aligned {
+            // SAFETY: QueueLayout::Aligned places head/tail at 8-byte aligned offsets.
+            unsafe { (&*(ptr as *const AtomicI64)).store(value, Ordering::Release) };
+        } else {
+            unsafe { ptr.write_unaligned(value) };
+        }
+    }
 }
 
 const fn count_queue_mem_size(queue_cap: u32) -> usize {
@@ -360,9 +437,13 @@ const fn count_queue_mem_size(queue_cap: u32) -> usize {
 
 #[cfg(test)]
 mod test {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        hint::black_box,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
-    use super::{QUEUE_HEADER_LENGTH, Queue};
+    use super::{QUEUE_HEADER_LENGTH, Queue, QueueLayout};
     use crate::{
         consts::QUEUE_ELEMENT_LEN,
         queue::{QueueElement, QueueManager},
@@ -372,8 +453,8 @@ mod test {
     fn test_queue_manager_create_mapping() {
         let path = "/tmp/ipc1.queue";
 
-        let qm1 = QueueManager::create_with_file(path, 8192).unwrap();
-        let qm2 = QueueManager::mapping_with_file(path).unwrap();
+        let qm1 = QueueManager::create_with_file(path, 8192, 3).unwrap();
+        let qm2 = QueueManager::mapping_with_file(path, 3).unwrap();
 
         assert!(
             qm1.send_queue
@@ -486,10 +567,59 @@ mod test {
     }
 
     fn create_queue(cap: u32) -> Queue {
+        create_queue_with_layout(cap, QueueLayout::for_protocol_version(3))
+    }
+
+    fn create_queue_with_layout(cap: u32, layout: QueueLayout) -> Queue {
         let mem_size = QUEUE_HEADER_LENGTH + QUEUE_ELEMENT_LEN * cap as usize;
         let mut mem: Vec<u8> = vec![0u8; mem_size];
-        let queue = Queue::create_from_bytes(mem.as_mut_ptr(), cap);
+        let queue = Queue::create_from_bytes(mem.as_mut_ptr(), cap, layout);
         std::mem::forget(mem);
         queue
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_queue_layout_put_pop() {
+        const ITERS: usize = 10_000_000;
+        for layout in [QueueLayout::Legacy, QueueLayout::Aligned] {
+            let q = create_queue_with_layout(1024, layout);
+            let start = Instant::now();
+            let mut checksum = 0u32;
+            for i in 0..ITERS {
+                q.put(QueueElement {
+                    seq_id: black_box(i as u32),
+                    offset_in_shm_buf: black_box(i as u32),
+                    status: black_box(0),
+                })
+                .unwrap();
+                let element = q.pop().unwrap();
+                checksum = checksum.wrapping_add(element.seq_id);
+            }
+            let elapsed = start.elapsed();
+            let ns_per_round = elapsed.as_nanos() as f64 / ITERS as f64;
+            let rounds_per_sec = ITERS as f64 / elapsed.as_secs_f64();
+            println!(
+                "layout={layout:?} iters={ITERS} elapsed_ms={:.2} ns_per_put_pop={:.2} \
+                 rounds_per_sec={rounds_per_sec:.0} checksum={checksum}",
+                elapsed.as_secs_f64() * 1000.0,
+                ns_per_round,
+            );
+        }
+    }
+
+    #[test]
+    fn queue_layout_is_version_aware() {
+        assert_eq!(QueueLayout::Aligned, QueueLayout::for_protocol_version(4));
+
+        let legacy = QueueLayout::Legacy;
+        assert_eq!(4, legacy.head_offset());
+        assert_eq!(12, legacy.tail_offset());
+        assert_eq!(20, legacy.working_flag_offset());
+
+        let aligned = QueueLayout::Aligned;
+        assert_eq!(4, aligned.working_flag_offset());
+        assert_eq!(8, aligned.head_offset());
+        assert_eq!(16, aligned.tail_offset());
     }
 }

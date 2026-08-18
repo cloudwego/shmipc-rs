@@ -21,6 +21,18 @@ name = "greeter_client_tokio"
 path = "src/hello_world/greeter_client_tokio.rs"
 
 [[bin]]
+name = "greeter_client_v4_default"
+path = "src/hello_world/greeter_client_v4_default.rs"
+
+[[bin]]
+name = "greeter_client_v4_eventfd"
+path = "src/hello_world/greeter_client_v4_eventfd.rs"
+
+[[bin]]
+name = "greeter_client_v4_polling"
+path = "src/hello_world/greeter_client_v4_polling.rs"
+
+[[bin]]
 name = "greeter_server"
 path = "src/hello_world/greeter_server.rs"
 

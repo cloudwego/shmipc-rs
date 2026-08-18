@@ -15,6 +15,7 @@
 use std::os::unix::net::SocketAddr;
 
 use shmipc::{
+    config::Config,
     session::{SessionManager, SessionManagerConfig},
     transport::DefaultUnixConnect,
 };
@@ -25,14 +26,12 @@ async fn main() {
     let dir = std::env::current_dir().unwrap();
     let uds_path = SocketAddr::from_pathname(dir.join("../ipc_test.sock")).unwrap();
 
-    let mut conf = SessionManagerConfig::new();
-    conf.config_mut().mem_map_type = shmipc::consts::MemMapType::MemMapTypeMemFd;
-    conf.config_mut().share_memory_path_prefix = "/dev/shm/client.ipc.shm".to_string();
-    #[cfg(target_os = "macos")]
-    {
-        conf.config.share_memory_path_prefix = "/tmp/client.ipc.shm".to_string();
-        conf.config.queue_path = "/tmp/client.ipc.shm_queue".to_string();
-    }
+    // V4 default uses Go-compatible V4 negotiation while keeping the Unix-socket polling wakeup
+    // path. This is the safest first step when rolling out V4 because it does not require eventfd
+    // support from the peer.
+    let mut config = Config::default().with_v4();
+    config.share_memory_path_prefix = "/dev/shm/client.v4.default.ipc.shm".to_owned();
+    let conf = SessionManagerConfig::new().with_config(config);
 
     let sm = SessionManager::new(conf, DefaultUnixConnect, uds_path)
         .await
