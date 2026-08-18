@@ -36,7 +36,8 @@ use crate::{
 #[derive(Debug)]
 struct PinRegistry {
     buffer_manager: Arc<BufferManager>,
-    slots: Mutex<Vec<PinSlot>>,
+    /// Accessed only while the owning `LinkedBuffer` holds its `recycle_mux`.
+    slots: Vec<PinSlot>,
 }
 
 #[derive(Debug)]
@@ -49,18 +50,17 @@ impl PinRegistry {
     fn new(buffer_manager: Arc<BufferManager>) -> Self {
         Self {
             buffer_manager,
-            slots: Mutex::new(Vec::new()),
+            slots: Vec::new(),
         }
     }
 
-    fn acquire(&self, slice: &BufferSlice) -> PinLease {
+    fn acquire(&mut self, slice: &BufferSlice) -> PinLease {
         let key = slice.data as usize;
-        let mut slots = self.slots.lock().unwrap();
-        let state = if let Some(slot) = slots.iter().find(|slot| slot.key == key) {
+        let state = if let Some(slot) = self.slots.iter().find(|slot| slot.key == key) {
             slot.state.clone()
         } else {
             let state = Arc::new(SlicePinState::new(self.buffer_manager.clone()));
-            slots.push(PinSlot {
+            self.slots.push(PinSlot {
                 key,
                 state: state.clone(),
             });
@@ -71,22 +71,18 @@ impl PinRegistry {
 
     fn is_pinned(&self, slice: &BufferSlice) -> bool {
         self.slots
-            .lock()
-            .unwrap()
             .iter()
             .find(|slot| slot.key == slice.data as usize)
             .is_some_and(|slot| Arc::strong_count(&slot.state) != 1)
     }
 
-    fn retire(&self, slice: BufferSlice) {
+    fn retire(&mut self, slice: BufferSlice) {
         let key = slice.data as usize;
-        let state = {
-            let mut slots = self.slots.lock().unwrap();
-            slots
-                .iter()
-                .position(|slot| slot.key == key)
-                .map(|idx| slots.swap_remove(idx).state)
-        };
+        let state = self
+            .slots
+            .iter()
+            .position(|slot| slot.key == key)
+            .map(|idx| self.slots.swap_remove(idx).state);
         if let Some(state) = state {
             state.retire(slice);
         } else {
@@ -94,15 +90,13 @@ impl PinRegistry {
         }
     }
 
-    fn abandon(&self, slice: &BufferSlice) {
+    fn abandon(&mut self, slice: &BufferSlice) {
         let key = slice.data as usize;
-        let state = {
-            let mut slots = self.slots.lock().unwrap();
-            slots
-                .iter()
-                .position(|slot| slot.key == key)
-                .map(|idx| slots.swap_remove(idx).state)
-        };
+        let state = self
+            .slots
+            .iter()
+            .position(|slot| slot.key == key)
+            .map(|idx| self.slots.swap_remove(idx).state);
         if let Some(state) = state {
             debug_assert_eq!(Arc::strong_count(&state), 1);
             debug_assert!(state.retired_slice.lock().unwrap().is_none());
@@ -730,7 +724,7 @@ mod tests {
             assert_eq!(4096, r.len());
         }
         {
-            let slots = buf.pin_registry.slots.lock().unwrap();
+            let slots = &buf.pin_registry.slots;
             let state = &slots.first().unwrap().state;
             assert_eq!(Arc::strong_count(state), 1);
             assert!(state.retired_slice.lock().unwrap().is_none());
@@ -799,7 +793,7 @@ mod tests {
         buffer.discard(buffer.len()).unwrap();
         buffer.release_previous_read();
 
-        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+        assert!(buffer.pin_registry.slots.is_empty());
         assert!(manager.remain_size() > remaining_after_write);
         assert!(!manager.check_buffer_returned());
 
@@ -973,7 +967,7 @@ mod tests {
         assert_eq!(dst.filled(), b"abcd");
         assert_eq!(buffer.len(), 5);
         assert_eq!(buffer.slice_list.size(), 2);
-        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+        assert!(buffer.pin_registry.slots.is_empty());
 
         let mut second = [0; 8];
         let mut dst = ReadBuf::new(&mut second);
@@ -982,7 +976,7 @@ mod tests {
         assert!(buffer.is_empty());
         assert_eq!(buffer.slice_list.size(), 1);
         assert_eq!(buffer.slice_list.front().unwrap().size(), 0);
-        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+        assert!(buffer.pin_registry.slots.is_empty());
 
         buffer.clean();
     }
@@ -1045,7 +1039,7 @@ mod tests {
         assert_eq!(dst.filled(), data);
         assert!(buffer.is_empty());
         assert_eq!(buffer.slice_list.size(), 1);
-        assert!(buffer.pin_registry.slots.lock().unwrap().is_empty());
+        assert!(buffer.pin_registry.slots.is_empty());
 
         buffer.release_previous_read_and_reserve();
         assert_eq!(buffer.slice_list.size(), 1);
