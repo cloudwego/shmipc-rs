@@ -123,10 +123,6 @@ impl Stream {
     pub const fn stream_id(&self) -> u32 {
         self.id
     }
-
-    pub(crate) fn shares_inner_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
-    }
 }
 
 impl Clone for Stream {

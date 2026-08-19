@@ -190,6 +190,7 @@ async fn stream_ext_reads_from_replaced_inner_stream() {
                 };
                 drop(request);
                 must_write_bytes(&mut stream, response).await;
+                stream.close().await.unwrap();
             }
         });
         s.spawn(async move {
@@ -207,6 +208,21 @@ async fn stream_ext_reads_from_replaced_inner_stream() {
             must_write_bytes(&mut new_stream, b"n").await;
 
             let mut stream = StreamExt::new(old_stream);
+
+            let mut response = [0; OLD_RESPONSE.len()];
+            within("read old stream", stream.read_exact(&mut response))
+                .await
+                .unwrap();
+            assert_eq!(&response, OLD_RESPONSE);
+
+            let mut eof = [0; 1];
+            assert_eq!(
+                within("read old stream EOF", stream.read(&mut eof))
+                    .await
+                    .unwrap(),
+                0
+            );
+
             *stream.inner_mut() = new_stream;
 
             let mut response = [0; NEW_RESPONSE.len()];
