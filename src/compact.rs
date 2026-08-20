@@ -19,12 +19,10 @@ pub struct StreamExt {
 
 impl StreamExt {
     pub fn new(inner: Stream) -> Self {
-        let read_stream = inner.clone();
-        let write_stream = inner.clone();
         Self {
             inner,
-            read_state: ReadState::Idle(read_stream),
-            write_state: WriteState::Idle(write_stream),
+            read_state: ReadState::Idle,
+            write_state: WriteState::Idle,
         }
     }
 
@@ -32,7 +30,11 @@ impl StreamExt {
         &self.inner
     }
 
-    pub const fn inner_mut(&mut self) -> &mut Stream {
+    /// Returns the inner stream mutably, canceling any pending read and clearing cached EOF.
+    pub fn inner_mut(&mut self) -> &mut Stream {
+        // The caller may replace `inner`. Cancel a wait on the old stream and clear its EOF state
+        // before handing out the mutable reference.
+        self.read_state = ReadState::Idle;
         &mut self.inner
     }
 
@@ -44,48 +46,16 @@ impl StreamExt {
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
 enum ReadState {
-    Idle(Stream),
-    Reading {
-        tracked_stream: Stream,
-        future: BoxFuture<'static, (Stream, Result<(), Error>)>,
-    },
-    Eof(Stream),
+    Idle,
+    Reading(BoxFuture<'static, (Stream, Result<(), Error>)>),
+    Eof,
     Transitioning,
-}
-
-impl ReadState {
-    fn belongs_to(&self, inner: &Stream) -> bool {
-        match self {
-            Self::Idle(stream)
-            | Self::Eof(stream)
-            | Self::Reading {
-                tracked_stream: stream,
-                ..
-            } => stream.shares_inner_with(inner),
-            Self::Transitioning => false,
-        }
-    }
 }
 
 enum WriteState {
-    // Keep the write-side handle in the state machine so an in-flight future owns it instead of
-    // borrowing `StreamExt::inner` across poll calls.
-    Idle(Stream),
-    Flushing(BoxFuture<'static, (Stream, Result<(), Error>)>),
-    Closing(BoxFuture<'static, (Stream, Result<(), Error>)>),
-    Transitioning,
-}
-
-impl WriteState {
-    fn sync_idle_with(&mut self, inner: &Stream) {
-        // An operation that is already in flight finishes on the stream where it started. The
-        // next operation switches to a replacement installed through `StreamExt::inner_mut`.
-        if let Self::Idle(stream) = self
-            && !stream.shares_inner_with(inner)
-        {
-            *stream = inner.clone();
-        }
-    }
+    Idle,
+    Flushing(BoxFuture<'static, Result<(), Error>>),
+    Closing(BoxFuture<'static, Result<(), Error>>),
 }
 
 impl AsyncRead for StreamExt {
@@ -98,33 +68,21 @@ impl AsyncRead for StreamExt {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if !this.read_state.belongs_to(&this.inner) {
-            this.read_state = ReadState::Idle(this.inner.clone());
-        }
 
         loop {
             match std::mem::replace(&mut this.read_state, ReadState::Transitioning) {
-                ReadState::Idle(mut stream) => {
-                    let tracked_stream = stream.clone();
+                ReadState::Idle => {
+                    let mut stream = this.inner.clone();
                     let fut = Box::pin(async move {
                         let result = stream.wait_readable().await;
                         (stream, result)
                     });
-                    this.read_state = ReadState::Reading {
-                        tracked_stream,
-                        future: fut,
-                    };
+                    this.read_state = ReadState::Reading(fut);
                 }
-                ReadState::Reading {
-                    tracked_stream,
-                    mut future,
-                } => {
+                ReadState::Reading(mut future) => {
                     let (mut stream, res) = match future.as_mut().poll(cx) {
                         Poll::Pending => {
-                            this.read_state = ReadState::Reading {
-                                tracked_stream,
-                                future,
-                            };
+                            this.read_state = ReadState::Reading(future);
                             return Poll::Pending;
                         }
                         Poll::Ready(res) => res,
@@ -134,37 +92,37 @@ impl AsyncRead for StreamExt {
                             match stream.read_available_into(buf, MAX_READ_SLICES_PER_POLL) {
                                 Ok(read) => {
                                     debug_assert!(read > 0);
-                                    this.read_state = ReadState::Idle(stream);
+                                    this.read_state = ReadState::Idle;
                                     return Poll::Ready(Ok(()));
                                 }
                                 Err(Error::NotEnoughData) => {
                                     // Another handle may have consumed the data after the wait
                                     // completed. Wait again instead of exposing a spurious EOF.
-                                    this.read_state = ReadState::Idle(stream);
+                                    this.read_state = ReadState::Idle;
                                 }
                                 Err(Error::EndOfStream) => {
-                                    this.read_state = ReadState::Eof(stream);
+                                    this.read_state = ReadState::Eof;
                                     return Poll::Ready(Ok(()));
                                 }
                                 Err(e) => {
-                                    this.read_state = ReadState::Idle(stream);
+                                    this.read_state = ReadState::Idle;
                                     return Poll::Ready(Err(e.into()));
                                 }
                             }
                         }
                         Err(Error::EndOfStream) => {
                             // AsyncRead represents EOF by successfully reading zero bytes.
-                            this.read_state = ReadState::Eof(stream);
+                            this.read_state = ReadState::Eof;
                             return Poll::Ready(Ok(()));
                         }
                         Err(e) => {
-                            this.read_state = ReadState::Idle(stream);
+                            this.read_state = ReadState::Idle;
                             return Poll::Ready(Err(e.into()));
                         }
                     }
                 }
-                ReadState::Eof(stream) => {
-                    this.read_state = ReadState::Eof(stream);
+                ReadState::Eof => {
+                    this.read_state = ReadState::Eof;
                     return Poll::Ready(Ok(()));
                 }
                 ReadState::Transitioning => unreachable!("invalid transient read state"),
@@ -185,14 +143,13 @@ impl AsyncWrite for StreamExt {
         }
 
         loop {
-            this.write_state.sync_idle_with(&this.inner);
             match &mut this.write_state {
-                WriteState::Idle(stream) => {
-                    return Poll::Ready(stream.write_bytes(buf).map_err(Into::into));
+                WriteState::Idle => {
+                    return Poll::Ready(this.inner.write_bytes(buf).map_err(Into::into));
                 }
                 WriteState::Flushing(future) => {
-                    let (stream, result) = ready!(future.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle(stream);
+                    let result = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle;
                     if let Err(error) = result {
                         return Poll::Ready(Err(error.into()));
                     }
@@ -203,7 +160,6 @@ impl AsyncWrite for StreamExt {
                         "close in progress during write",
                     )));
                 }
-                WriteState::Transitioning => unreachable!("invalid transient write state"),
             }
         }
     }
@@ -212,23 +168,17 @@ impl AsyncWrite for StreamExt {
         let this = self.get_mut();
 
         loop {
-            this.write_state.sync_idle_with(&this.inner);
             match &mut this.write_state {
-                WriteState::Idle(_) => {
-                    let WriteState::Idle(mut stream) =
-                        std::mem::replace(&mut this.write_state, WriteState::Transitioning)
-                    else {
-                        unreachable!();
-                    };
-                    let future = Box::pin(async move {
-                        let result = stream.flush(true).await;
-                        (stream, result)
-                    });
+                WriteState::Idle => {
+                    // Only the in-flight future needs its own handle. Keeping the idle state
+                    // empty avoids making `StreamExt` carry an extra `Stream` permanently.
+                    let mut stream = this.inner.clone();
+                    let future = Box::pin(async move { stream.flush(true).await });
                     this.write_state = WriteState::Flushing(future);
                 }
                 WriteState::Flushing(future) => {
-                    let (stream, result) = ready!(future.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle(stream);
+                    let result = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle;
                     match result {
                         Ok(_) | Err(Error::StreamClosed) => return Poll::Ready(Ok(())),
                         Err(e) => return Poll::Ready(Err(e.into())),
@@ -239,7 +189,6 @@ impl AsyncWrite for StreamExt {
                         "close in progress during flush",
                     )));
                 }
-                WriteState::Transitioning => unreachable!("invalid transient write state"),
             }
         }
     }
@@ -251,23 +200,15 @@ impl AsyncWrite for StreamExt {
         let this = self.get_mut();
 
         loop {
-            this.write_state.sync_idle_with(&this.inner);
             match &mut this.write_state {
-                WriteState::Idle(_) => {
-                    let WriteState::Idle(mut stream) =
-                        std::mem::replace(&mut this.write_state, WriteState::Transitioning)
-                    else {
-                        unreachable!();
-                    };
-                    let future = Box::pin(async move {
-                        let result = stream.close().await;
-                        (stream, result)
-                    });
+                WriteState::Idle => {
+                    let mut stream = this.inner.clone();
+                    let future = Box::pin(async move { stream.close().await });
                     this.write_state = WriteState::Closing(future);
                 }
                 WriteState::Closing(future) => {
-                    let (stream, result) = ready!(future.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle(stream);
+                    let result = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle;
                     match result {
                         Ok(_) => return Poll::Ready(Ok(())),
                         Err(e) => {
@@ -276,13 +217,12 @@ impl AsyncWrite for StreamExt {
                     }
                 }
                 WriteState::Flushing(future) => {
-                    let (stream, result) = ready!(future.as_mut().poll(cx));
-                    this.write_state = WriteState::Idle(stream);
+                    let result = ready!(future.as_mut().poll(cx));
+                    this.write_state = WriteState::Idle;
                     if let Err(e) = result {
                         return Poll::Ready(Err(e.into()));
                     }
                 }
-                WriteState::Transitioning => unreachable!("invalid transient write state"),
             }
         }
     }
@@ -290,12 +230,21 @@ impl AsyncWrite for StreamExt {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamExt;
+    use std::mem::size_of;
+
+    use super::{ReadState, StreamExt, WriteState};
+    use crate::stream::Stream;
 
     fn assert_unpin<T: Unpin>() {}
 
     #[test]
     fn stream_ext_remains_unpin() {
         assert_unpin::<StreamExt>();
+    }
+
+    #[test]
+    fn states_do_not_inline_a_stream_handle() {
+        assert!(size_of::<ReadState>() < size_of::<Stream>());
+        assert!(size_of::<WriteState>() < size_of::<Stream>());
     }
 }
