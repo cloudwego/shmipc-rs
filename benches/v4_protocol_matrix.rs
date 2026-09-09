@@ -301,17 +301,14 @@ fn benchmark_config(
     c
 }
 
+/// A flush the queue refuses drops the message, so it is written again before the next try.
 async fn must_write(s: &mut Stream, size: u32) {
-    write_empty_buffer(s.send_buf(), size);
     loop {
+        write_empty_buffer(s.send_buf(), size);
         match s.flush(false).await {
-            Err(Error::QueueFull) => {
-                tokio::time::sleep(Duration::from_micros(1)).await;
-            }
-            Err(err) => {
-                panic!("must write err:{err}");
-            }
-            Ok(_) => return,
+            Ok(()) => return,
+            Err(Error::QueueFull) => tokio::time::sleep(Duration::from_micros(1)).await,
+            Err(err) => panic!("must write err:{err}"),
         }
     }
 }
