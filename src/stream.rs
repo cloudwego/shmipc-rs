@@ -618,6 +618,9 @@ impl Stream {
             .fetch_add(1, Ordering::SeqCst);
         let root_buf_offset = send_buf.root_buf_offset();
         match retry_queue_put(&self.inner.close_notify, || {
+            if self.session.is_closed() {
+                return Err(Error::StreamClosed);
+            }
             self.session
                 .shared
                 .queue_manager
@@ -635,8 +638,6 @@ impl Stream {
                 send_buf.clean();
                 ret
             }
-            // The queue never took ownership, so retain the buffer for a caller retry.
-            Err(Error::QueueFull) => Err(Error::QueueFull),
             Err(err) => {
                 send_buf.recycle();
                 Err(err)
