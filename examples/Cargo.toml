@@ -39,3 +39,11 @@ path = "src/hello_world/greeter_server.rs"
 [[bin]]
 name = "greeter_server_tokio"
 path = "src/hello_world/greeter_server_tokio.rs"
+
+[[bin]]
+name = "v5_client"
+path = "src/v5/client.rs"
+
+[[bin]]
+name = "v5_server"
+path = "src/v5/server.rs"

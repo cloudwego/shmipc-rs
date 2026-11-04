@@ -111,7 +111,15 @@ impl Listener {
                     match Session::server(config.clone(), stream, tx).await {
                         Ok(session) => {
                             sessions.lock().unwrap().push(session.clone());
-                            tokio::spawn(session.recv_loop(rx, stream_tx.clone()));
+                            let sessions = sessions.clone();
+                            let stream_tx = stream_tx.clone();
+                            tokio::spawn(async move {
+                                session.clone().recv_loop(rx, stream_tx).await;
+                                sessions
+                                    .lock()
+                                    .unwrap()
+                                    .retain(|s| !Arc::ptr_eq(&s.shared, &session.shared));
+                            });
                         }
                         Err(err) => {
                             tracing::warn!("[ShmIPC] failed to create session, err: {err}");

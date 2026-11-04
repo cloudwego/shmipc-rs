@@ -33,8 +33,9 @@ use initializer::ProtocolInitialized;
 
 use crate::{
     buffer::manager::BufferManager,
-    config::{Config, ProtocolMode},
+    config::Config,
     consts::{BUFFER_PATH_SUFFIX, MemMapType},
+    protocol::adapter::{ClientNegotiation, SharedPool},
     queue::QueueManager,
 };
 
@@ -129,62 +130,103 @@ pub fn init_manager(
     })
 }
 
-pub const fn initial_client_proto_version(config: &Config) -> u8 {
-    match config.protocol.mode {
-        ProtocolMode::Legacy => match config.mem_map_type {
-            MemMapType::MemMapTypeDevShmFile => 2,
-            MemMapType::MemMapTypeMemFd => 3,
-        },
-        ProtocolMode::V4 { .. } => 4,
+/// Settles the protocol version with the peer.
+///
+/// The caller runs this before creating any shared memory, so that a version which does not use
+/// the shared buffer pool never pays for one.
+pub async fn negotiate_client_protocol(
+    conn_fd: RawFd,
+    config: Config,
+    timeout: Duration,
+) -> Result<ClientNegotiation, anyhow::Error> {
+    tracing::info!("starting negotiates shmipc client protocol");
+    let mut handler =
+        tokio::task::spawn_blocking(move || ClientProtocolAdapter::negotiate(conn_fd, &config));
+    match tokio::time::timeout(timeout, &mut handler).await {
+        Ok(res) => {
+            let negotiation = res??;
+            tracing::info!(
+                "shmipc client negotiated protocol version:{}",
+                negotiation.selected_protocol()
+            );
+            Ok(negotiation)
+        }
+        Err(_) => {
+            // SAFETY: caller guarantees `conn_fd` remains a valid socket
+            // for the duration of this function.
+            unsafe { libc::shutdown(conn_fd, libc::SHUT_RDWR) };
+            let _ = handler.await;
+            Err(anyhow!("ProtocolInitializer negotiate client timeout"))
+        }
     }
 }
 
+/// Exchanges shared memory with the peer over the version [`negotiate_client_protocol`] settled on.
+///
+/// `shared_pool` is what this side publishes, and is `None` exactly when the negotiated version
+/// does not use one.
 pub async fn init_client_protocol(
-    buffer_path: String,
-    buffer_memfd: RawFd,
-    queue_path: String,
-    queue_memfd: RawFd,
+    negotiation: ClientNegotiation,
+    shared_pool: Option<SharedPool>,
     conn_fd: RawFd,
     config: Config,
     timeout: Duration,
 ) -> Result<ProtocolInitialized, anyhow::Error> {
+    if timeout.is_zero() {
+        return Err(anyhow!(
+            "ProtocolInitializer init client has no time left in the {:?} handshake budget",
+            config.initialize_timeout
+        ));
+    }
     tracing::info!("starting initializes shmipc client protocol");
-    let handler = tokio::task::spawn_blocking(move || {
-        let adapter = ClientProtocolAdapter::new(
-            conn_fd,
-            config,
-            buffer_path,
-            queue_path,
-            buffer_memfd,
-            queue_memfd,
-        );
-        let initializer = adapter.get_initializer()?;
+    let mut handler = tokio::task::spawn_blocking(move || {
+        let adapter = ClientProtocolAdapter::new(conn_fd, config, shared_pool);
+        let initializer = adapter.get_initializer(negotiation)?;
         initializer.init()
     });
-    match tokio::time::timeout(timeout, std::pin::pin!(handler)).await {
-        Ok(res) => res?,
-        Err(_) => Err(anyhow!(
-            "ProtocolInitializer init client timeout:{:?} ms",
-            timeout
-        )),
+    match tokio::time::timeout(timeout, &mut handler).await {
+        Ok(res) => {
+            let initialized = res??;
+            tracing::info!(
+                "shmipc client protocol initialized, version:{} feature:{:?}",
+                initialized.proto_version,
+                initialized.feature
+            );
+            Ok(initialized)
+        }
+        Err(_) => {
+            unsafe { libc::shutdown(conn_fd, libc::SHUT_RDWR) };
+            let _ = handler.await;
+            Err(anyhow!("ProtocolInitializer init client timeout"))
+        }
     }
 }
 
 pub async fn init_server_protocol(
     conn_fd: RawFd,
+    config: Config,
     timeout: Duration,
 ) -> Result<ProtocolInitialized, anyhow::Error> {
     tracing::info!("starting initializes shmipc server protocol");
-    let handler = tokio::task::spawn_blocking(move || {
-        let adapter = ServerProtocolAdapter::new(conn_fd);
+    let mut handler = tokio::task::spawn_blocking(move || {
+        let adapter = ServerProtocolAdapter::new(conn_fd, config);
         let initializer = adapter.get_initializer()?;
         initializer.init()
     });
-    match tokio::time::timeout(timeout, std::pin::pin!(handler)).await {
-        Ok(res) => res?,
-        Err(_) => Err(anyhow!(
-            "ProtocolInitializer init server timeout:{:?} ms",
-            timeout
-        )),
+    match tokio::time::timeout(timeout, &mut handler).await {
+        Ok(res) => {
+            let initialized = res??;
+            tracing::info!(
+                "shmipc server protocol initialized, version:{} feature:{:?}",
+                initialized.proto_version,
+                initialized.feature
+            );
+            Ok(initialized)
+        }
+        Err(_) => {
+            unsafe { libc::shutdown(conn_fd, libc::SHUT_RDWR) };
+            let _ = handler.await;
+            Err(anyhow!("ProtocolInitializer init server timeout"))
+        }
     }
 }

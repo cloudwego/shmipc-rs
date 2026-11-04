@@ -18,7 +18,7 @@ use anyhow::anyhow;
 
 use crate::consts::{
     DEFAULT_BUFFER_SLICE_SIZES, DEFAULT_QUEUE_CAP, DEFAULT_QUEUE_PATH, DEFAULT_SHARE_MEMORY_CAP,
-    MemMapType, SESSION_REBUILD_INTERVAL,
+    DEFAULT_V5_QUEUE_PUBLISH_TIMEOUT, MemMapType, SESSION_REBUILD_INTERVAL,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -84,17 +84,21 @@ pub struct Config {
     /// Keep this as [`ProtocolConfig::default`] for legacy behavior. Set it explicitly only when
     /// the client should initiate V4 negotiation.
     pub protocol: ProtocolConfig,
+
+    /// How long a V5 consumer waits for a peer that has claimed a queue slot to publish it.
+    pub v5_queue_publish_timeout: Duration,
 }
 
 /// Protocol-level configuration.
 ///
-/// `mode` chooses legacy vs V4 negotiation. `wakeup` selects an optional V4 wakeup feature. Wakeup
-/// features are only valid with [`ProtocolMode::V4`].
+/// `mode` chooses legacy behavior or JSON negotiation. `wakeup` selects an optional wakeup
+/// feature, which is only valid with a negotiating mode ([`ProtocolMode::V4`] or
+/// [`ProtocolMode::V5`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProtocolConfig {
     /// Protocol negotiation mode.
     pub mode: ProtocolMode,
-    /// Optional wakeup feature requested by the client during V4 negotiation.
+    /// Optional wakeup feature requested by the client during negotiation.
     pub wakeup: WakeupMode,
 }
 
@@ -117,6 +121,16 @@ pub enum ProtocolMode {
         /// during initial V4 setup.
         fallback: bool,
     },
+
+    /// Announce V5 and V4 during JSON negotiation and let the peer select between them.
+    ///
+    /// V5 gives each endpoint its own queue and dynamic segment rather than a shared buffer pool,
+    /// so it requires [`MemMapType::MemMapTypeMemFd`].
+    V5 {
+        /// Whether a client should reconnect and retry legacy V3 after network/protocol failures
+        /// during initial setup, on the same terms as [`ProtocolMode::V4`].
+        fallback: bool,
+    },
 }
 
 /// Optional V4 wakeup feature.
@@ -128,14 +142,16 @@ pub enum WakeupMode {
     /// Let the peer periodically drain the shared-memory queue instead of sending a wakeup per
     /// queue element.
     ///
-    /// The interval is encoded into the V4 negotiation request and both sides use the negotiated
+    /// The interval is encoded into the negotiation request and both sides use the negotiated
     /// interval. Lower intervals reduce latency but increase timer activity. The interval must be
     /// greater than zero.
     EventQueuePolling { interval: Duration },
     /// Use Linux `eventfd` for queue wakeups.
     ///
-    /// This mode requires [`MemMapType::MemMapTypeMemFd`] because V4 eventfd negotiation passes
-    /// four file descriptors: buffer fd, queue fd, and two eventfds.
+    /// This mode requires [`MemMapType::MemMapTypeMemFd`] because eventfd negotiation passes the
+    /// descriptors out of band: V4 sends four in one direction (buffer fd, queue fd, and two
+    /// eventfds), while V5 sends three each way (queue fd, dynshm fd, and the eventfd that side
+    /// waits on).
     EventFd,
 }
 
@@ -155,6 +171,7 @@ impl Default for Config {
             rebuild_interval: SESSION_REBUILD_INTERVAL,
             max_stream_num: 4096,
             protocol: ProtocolConfig::default(),
+            v5_queue_publish_timeout: DEFAULT_V5_QUEUE_PUBLISH_TIMEOUT,
         }
     }
 }
@@ -194,12 +211,42 @@ impl Config {
         self
     }
 
+    /// Enable V5 negotiation with the default Unix-socket polling wakeup path.
+    ///
+    /// The helper sets [`ProtocolMode::V5`] with `fallback = true` and keeps
+    /// [`WakeupMode::Default`]. V5 is announced alongside V4, so a peer that only speaks V4
+    /// still connects without a reconnect.
+    pub fn with_v5(mut self) -> Self {
+        self.protocol.mode = ProtocolMode::V5 { fallback: true };
+        self
+    }
+
+    /// Enable V5 negotiation and request Linux `eventfd` wakeups.
+    ///
+    /// This is the recommended V5 mode for low-latency small-message workloads.
+    pub fn with_v5_eventfd(mut self) -> Self {
+        self.protocol.mode = ProtocolMode::V5 { fallback: true };
+        self.protocol.wakeup = WakeupMode::EventFd;
+        self
+    }
+
+    /// Enable V5 negotiation and request periodic queue polling.
+    ///
+    /// Use this when reducing per-message wakeup traffic is more important than immediate
+    /// delivery. The interval must be greater than zero and is shared with the peer through
+    /// negotiation.
+    pub fn with_v5_event_queue_polling(mut self, interval: Duration) -> Self {
+        self.protocol.mode = ProtocolMode::V5 { fallback: true };
+        self.protocol.wakeup = WakeupMode::EventQueuePolling { interval };
+        self
+    }
+
     pub fn verify(&mut self) -> Result<(), anyhow::Error> {
         if matches!(self.protocol.mode, ProtocolMode::Legacy)
             && !matches!(self.protocol.wakeup, WakeupMode::Default)
         {
             return Err(anyhow!(
-                "wakeup features require ProtocolMode::V4; legacy mode cannot enable {:?}",
+                "wakeup features require ProtocolMode::V4 or V5; legacy mode cannot enable {:?}",
                 self.protocol.wakeup
             ));
         }
@@ -214,6 +261,11 @@ impl Config {
             && !matches!(self.mem_map_type, MemMapType::MemMapTypeMemFd)
         {
             return Err(anyhow!("eventfd wakeup requires memfd shared memory"));
+        }
+        if matches!(self.protocol.mode, ProtocolMode::V5 { .. })
+            && !matches!(self.mem_map_type, MemMapType::MemMapTypeMemFd)
+        {
+            return Err(anyhow!("ProtocolMode::V5 requires memfd shared memory"));
         }
 
         if self.share_memory_buffer_cap < (1 << 20) {
@@ -349,6 +401,14 @@ mod tests {
         let config = Config::default().with_v4_eventfd();
 
         assert_eq!(ProtocolMode::V4 { fallback: true }, config.protocol.mode);
+        assert_eq!(WakeupMode::EventFd, config.protocol.wakeup);
+    }
+
+    #[test]
+    fn v5_helpers_set_protocol_config() {
+        let config = Config::default().with_v5_eventfd();
+
+        assert_eq!(ProtocolMode::V5 { fallback: true }, config.protocol.mode);
         assert_eq!(WakeupMode::EventFd, config.protocol.wakeup);
     }
 }

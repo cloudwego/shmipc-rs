@@ -17,9 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::seq::SliceRandom;
 use shmipc::{
     Error, Listener,
-    buffer::{BufferReader, BufferSlice, LinkedBuffer},
     compact::StreamExt,
     config::{Config, SizePercentPair},
     consts::MemMapType,
@@ -33,6 +33,7 @@ use tokio::io::AsyncReadExt;
 const DEFAULT_ITERS: usize = 5_000;
 const DEFAULT_WARMUP_ITERS: usize = 500;
 const DEFAULT_PAYLOAD_BYTES: u32 = 64;
+const DEFAULT_ROUNDS: usize = 5;
 const POLLING_INTERVAL: Duration = Duration::from_micros(100);
 
 #[derive(Clone, Copy)]
@@ -72,6 +73,7 @@ fn main() {
     let iters = env_usize("SHMIPC_PERF_ITERS", DEFAULT_ITERS);
     let warmup_iters = env_usize("SHMIPC_PERF_WARMUP_ITERS", DEFAULT_WARMUP_ITERS);
     let payload_bytes = env_u32("SHMIPC_PERF_PAYLOAD_BYTES", DEFAULT_PAYLOAD_BYTES);
+    let rounds = env_usize("SHMIPC_PERF_ROUNDS", DEFAULT_ROUNDS);
     let read_path = env_read_path("SHMIPC_PERF_READ_PATH");
     let slice_bytes = env_optional_u32("SHMIPC_PERF_SLICE_BYTES");
 
@@ -97,6 +99,18 @@ fn main() {
             name: "v4-eventfd",
             configure: Config::with_v4_eventfd,
         },
+        BenchMode {
+            name: "v5-default",
+            configure: Config::with_v5,
+        },
+        BenchMode {
+            name: "v5-polling-100us",
+            configure: |config| config.with_v5_event_queue_polling(POLLING_INTERVAL),
+        },
+        BenchMode {
+            name: "v5-eventfd",
+            configure: Config::with_v5_eventfd,
+        },
     ];
     let modes = match env_modes("SHMIPC_PERF_MODES") {
         Some(selected_modes) => selected_modes
@@ -106,19 +120,52 @@ fn main() {
         None => modes.to_vec(),
     };
 
-    let mut results = Vec::with_capacity(modes.len());
-    for mode in modes {
-        results.push(runtime.block_on(run_mode(
-            mode,
-            iters,
-            warmup_iters,
-            payload_bytes,
-            read_path,
-            slice_bytes,
-        )));
+    let mut modes = modes;
+    let mut rng = rand::rng();
+
+    let mut by_mode = modes
+        .iter()
+        .map(|mode| (mode.name, Vec::with_capacity(rounds)))
+        .collect::<Vec<(&'static str, Vec<BenchResult>)>>();
+
+    for _ in 0..rounds {
+        modes.shuffle(&mut rng);
+        for mode in &modes {
+            let result = runtime.block_on(run_mode(
+                *mode,
+                iters,
+                warmup_iters,
+                payload_bytes,
+                read_path,
+                slice_bytes,
+            ));
+            let bucket = by_mode
+                .iter_mut()
+                .find(|(name, _)| *name == mode.name)
+                .expect("every mode was given a bucket");
+            bucket.1.push(result);
+            // Idle time
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
-    print_results(&results, warmup_iters, read_path, slice_bytes);
+    let results = by_mode
+        .iter()
+        .map(|(_, rounds)| median_round_by_ops(rounds))
+        .collect::<Vec<_>>();
+
+    print_results(&results, warmup_iters, read_path, slice_bytes, rounds);
+    if rounds > 1 {
+        print_spread(&by_mode);
+    }
+}
+
+/// The middle round by throughput, taken whole so its wall time, CPU time and counters all
+/// describe one run rather than being averaged across runs that never happened together.
+fn median_round_by_ops(results: &[BenchResult]) -> BenchResult {
+    let mut sorted = results.to_vec();
+    sorted.sort_by(|left, right| ops(left).total_cmp(&ops(right)));
+    sorted.swap_remove(sorted.len() / 2)
 }
 
 async fn run_mode(
@@ -248,7 +295,7 @@ impl BenchClient {
 
 async fn serve_discard(mut stream: Stream, payload_bytes: u32) {
     while must_read(&mut stream, payload_bytes).await {
-        stream.recv_buf().release_previous_read();
+        stream.release_read_and_reuse();
         must_write(&mut stream, payload_bytes).await;
     }
 }
@@ -257,7 +304,7 @@ async fn serve_stream_ext(stream: Stream, payload_bytes: u32) {
     let mut stream = StreamExt::new(stream);
     let mut read_buf = vec![0; payload_bytes as usize];
     while must_read_stream_ext(&mut stream, &mut read_buf).await {
-        stream.inner().recv_buf().release_previous_read();
+        stream.inner().release_read_and_reuse();
         must_write(stream.inner_mut(), payload_bytes).await;
     }
 }
@@ -291,7 +338,6 @@ fn benchmark_config(
     };
     let mut c = SessionManagerConfig::new().with_config(Config {
         mem_map_type: MemMapType::MemMapTypeMemFd,
-        queue_cap: 65536,
         connection_write_timeout: Duration::from_secs(1),
         share_memory_buffer_cap: 256 << 20,
         buffer_slice_sizes,
@@ -304,46 +350,15 @@ fn benchmark_config(
 /// A flush the queue refuses drops the message, so it is written again before the next try.
 async fn must_write(s: &mut Stream, size: u32) {
     loop {
-        write_empty_buffer(s.send_buf(), size);
+        if size > 0 {
+            s.reserve(size as usize).expect("reserve payload");
+        }
         match s.flush(false).await {
             Ok(()) => return,
             Err(Error::QueueFull) => tokio::time::sleep(Duration::from_micros(1)).await,
             Err(err) => panic!("must write err:{err}"),
         }
     }
-}
-
-fn write_empty_buffer(l: &mut LinkedBuffer, size: u32) {
-    if size == 0 {
-        return;
-    }
-    let mut wrote = 0;
-    loop {
-        if l.slice_list().write_slice.is_none() {
-            l.alloc(size - wrote);
-            l.slice_list_mut().write_slice = l.slice_list().front_slice;
-        }
-        wrote += write_empty_slice(l.slice_list().write_mut().unwrap(), size - wrote);
-        if wrote < size {
-            if l.slice_list().write().unwrap().next().is_none() {
-                l.alloc(size - wrote);
-            }
-            l.slice_list_mut().write_slice = l.slice_list().write().unwrap().next_slice;
-        } else {
-            break;
-        }
-    }
-    *l.len_mut() += size as usize;
-}
-
-fn write_empty_slice(slice: &mut BufferSlice, size: u32) -> u32 {
-    slice.write_index += size as usize;
-    if slice.write_index > slice.cap as usize {
-        let wrote = slice.cap - (slice.write_index as u32 - size);
-        slice.write_index = slice.cap as usize;
-        return wrote;
-    }
-    size
 }
 
 async fn must_read(s: &mut Stream, size: u32) -> bool {
@@ -357,7 +372,14 @@ async fn must_read(s: &mut Stream, size: u32) -> bool {
 async fn must_read_stream_ext(stream: &mut StreamExt, buf: &mut [u8]) -> bool {
     match stream.read_exact(buf).await {
         Ok(_) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            false
+        }
         Err(err) => panic!("must read err:{err}"),
     }
 }
@@ -430,70 +452,199 @@ fn timeval_to_duration(time: libc::timeval) -> Duration {
     Duration::from_secs(time.tv_sec as u64) + Duration::from_micros(time.tv_usec as u64)
 }
 
+fn print_table(header: &[&str], rows: &[Vec<String>]) {
+    let widths = (0..header.len())
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].len())
+                .chain([header[column].len(), 3])
+                .max()
+                .expect("the chain always yields the header width")
+        })
+        .collect::<Vec<_>>();
+
+    let line = |cells: &[String]| {
+        let mut out = String::from("|");
+        for (column, cell) in cells.iter().enumerate() {
+            let width = widths[column];
+            if column == 0 {
+                out.push_str(&format!(" {cell:<width$} |"));
+            } else {
+                out.push_str(&format!(" {cell:>width$} |"));
+            }
+        }
+        out
+    };
+
+    let header_cells = header.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+    println!("{}", line(&header_cells));
+
+    let mut separator = String::from("|");
+    for (column, width) in widths.iter().enumerate() {
+        if column == 0 {
+            separator.push_str(&format!("{}|", "-".repeat(width + 2)));
+        } else {
+            separator.push_str(&format!("{}:|", "-".repeat(width + 1)));
+        }
+    }
+    println!("{separator}");
+
+    for row in rows {
+        println!("{}", line(row));
+    }
+}
+
 fn print_results(
     results: &[BenchResult],
     warmup_iters: usize,
     read_path: ReadPath,
     slice_bytes: Option<u32>,
+    rounds: usize,
 ) {
-    println!("# shmipc V4 protocol matrix benchmark");
+    println!("# shmipc V4/V5 protocol matrix benchmark");
     println!();
     println!(
-        "warmup_iters={} measured_iters={} payload_bytes={} read_path={} slice_bytes={}",
+        "rounds={} warmup_iters={} measured_iters={} payload_bytes={} read_path={} slice_bytes={}",
+        rounds,
         warmup_iters,
         results[0].iters,
         results[0].payload_bytes,
         read_path.name(),
         slice_bytes
             .map(|value| value.to_string())
-            .unwrap_or_else(|| "default".to_owned())
+            .unwrap_or_else(|| "default".to_owned()),
     );
     println!();
-    println!(
-        "| mode | ops/s | MiB/s | p50 us | p99 us | wall ms | cpu ms | cpu/wall | send polling | \
-         recv polling | out bytes | in bytes |"
-    );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
-    for result in results {
-        let wall_secs = result.wall.as_secs_f64();
-        let ops_per_sec = result.iters as f64 / wall_secs;
-        let mib_per_sec =
-            (result.iters as f64 * result.payload_bytes as f64 * 2.0) / wall_secs / 1024.0 / 1024.0;
-        let cpu_wall = result.cpu.as_secs_f64() / wall_secs;
-        println!(
-            "| {} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} |",
-            result.mode,
-            ops_per_sec,
-            mib_per_sec,
-            result.p50.as_secs_f64() * 1_000_000.0,
-            result.p99.as_secs_f64() * 1_000_000.0,
-            result.wall.as_secs_f64() * 1_000.0,
-            result.cpu.as_secs_f64() * 1_000.0,
-            cpu_wall,
-            result.stats.send_polling_event_count,
-            result.stats.recv_polling_event_count,
-            result.stats.out_flow_bytes,
-            result.stats.in_flow_bytes,
-        );
-    }
+    let rows = results
+        .iter()
+        .map(|result| {
+            let wall_secs = result.wall.as_secs_f64();
+            let mib_per_sec = (result.iters as f64 * result.payload_bytes as f64 * 2.0)
+                / wall_secs
+                / 1024.0
+                / 1024.0;
+            vec![
+                result.mode.to_owned(),
+                format!("{:.0}", ops(result)),
+                format!("{mib_per_sec:.2}"),
+                format!("{:.2}", result.p50.as_secs_f64() * 1_000_000.0),
+                format!("{:.2}", result.p99.as_secs_f64() * 1_000_000.0),
+                format!("{:.2}", wall_secs * 1_000.0),
+                format!("{:.2}", result.cpu.as_secs_f64() * 1_000.0),
+                format!("{:.2}", result.cpu.as_secs_f64() / wall_secs),
+                result.stats.send_polling_event_count.to_string(),
+                result.stats.recv_polling_event_count.to_string(),
+                result.stats.out_flow_bytes.to_string(),
+                result.stats.in_flow_bytes.to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &[
+            "mode",
+            "ops/s",
+            "MiB/s",
+            "p50 us",
+            "p99 us",
+            "wall ms",
+            "cpu ms",
+            "cpu/wall",
+            "send polling",
+            "recv polling",
+            "out bytes",
+            "in bytes",
+        ],
+        &rows,
+    );
 
     if let Some(legacy) = results.iter().find(|result| result.mode == "legacy-v3") {
+        let legacy_ops = ops(legacy);
+        let legacy_p99 = legacy.p99.as_secs_f64();
+        let rows = results
+            .iter()
+            .filter(|result| result.mode != "legacy-v3")
+            .map(|result| {
+                vec![
+                    result.mode.to_owned(),
+                    format!("{:+.2}%", (ops(result) / legacy_ops - 1.0) * 100.0),
+                    format!(
+                        "{:+.2}%",
+                        (result.p99.as_secs_f64() / legacy_p99 - 1.0) * 100.0
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
         println!();
         println!("## Relative to legacy-v3");
         println!();
-        println!("| mode | ops/s delta | p99 delta |");
-        println!("|---|---:|---:|");
-        let legacy_ops = legacy.iters as f64 / legacy.wall.as_secs_f64();
-        let legacy_p99 = legacy.p99.as_secs_f64();
-        for result in results.iter().filter(|result| result.mode != "legacy-v3") {
-            let ops = result.iters as f64 / result.wall.as_secs_f64();
-            let ops_delta = (ops / legacy_ops - 1.0) * 100.0;
-            let p99_delta = (result.p99.as_secs_f64() / legacy_p99 - 1.0) * 100.0;
-            println!(
-                "| {} | {:+.2}% | {:+.2}% |",
-                result.mode, ops_delta, p99_delta
-            );
-        }
+        print_table(&["mode", "ops/s delta", "p99 delta"], &rows);
     }
+
+    let pairs = [
+        ("v4-default", "v5-default"),
+        ("v4-polling-100us", "v5-polling-100us"),
+        ("v4-eventfd", "v5-eventfd"),
+    ];
+    let rows = pairs
+        .iter()
+        .filter_map(|(v4_name, v5_name)| {
+            let v4 = results.iter().find(|result| result.mode == *v4_name)?;
+            let v5 = results.iter().find(|result| result.mode == *v5_name)?;
+            Some(vec![
+                v4_name.trim_start_matches("v4-").to_owned(),
+                format!("{:.0}", ops(v4)),
+                format!("{:.0}", ops(v5)),
+                format!("{:+.2}%", (ops(v5) / ops(v4) - 1.0) * 100.0),
+                format!(
+                    "{:+.2}%",
+                    (v5.p99.as_secs_f64() / v4.p99.as_secs_f64() - 1.0) * 100.0
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if !rows.is_empty() {
+        println!();
+        println!("## V5 relative to V4 (same wakeup mode)");
+        println!();
+        print_table(
+            &["wakeup", "v4 ops/s", "v5 ops/s", "ops/s delta", "p99 delta"],
+            &rows,
+        );
+    }
+}
+
+/// How far each mode moved between rounds, which is what says whether a delta in the tables above
+/// is a real difference or just the noise floor of this machine.
+fn print_spread(by_mode: &[(&'static str, Vec<BenchResult>)]) {
+    let rows = by_mode
+        .iter()
+        .filter(|(_, results)| !results.is_empty())
+        .map(|(mode, results)| {
+            let mut throughput = results.iter().map(ops).collect::<Vec<_>>();
+            throughput.sort_by(f64::total_cmp);
+            let min = throughput[0];
+            let median = throughput[throughput.len() / 2];
+            let max = throughput[throughput.len() - 1];
+            vec![
+                (*mode).to_owned(),
+                format!("{min:.0}"),
+                format!("{median:.0}"),
+                format!("{max:.0}"),
+                format!("{:.2}%", (max / min - 1.0) * 100.0),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    println!();
+    println!("## Spread across rounds");
+    println!();
+    print_table(
+        &["mode", "min ops/s", "median ops/s", "max ops/s", "spread"],
+        &rows,
+    );
+}
+
+fn ops(result: &BenchResult) -> f64 {
+    result.iters as f64 / result.wall.as_secs_f64()
 }

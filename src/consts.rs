@@ -18,7 +18,7 @@ use crate::{buffer::manager::BUFFER_HEADER_SIZE, config::SizePercentPair};
 
 pub const PROTO_VERSION: u8 = 2;
 pub const MAX_LEGACY_PROTO_VERSION: u8 = 3;
-pub const MAX_SUPPORT_PROTO_VERSION: u8 = 4;
+pub const MAX_SUPPORT_PROTO_VERSION: u8 = 5;
 pub const MAGIC_NUMBER: u16 = 0x7758;
 
 #[repr(u8)]
@@ -90,3 +90,32 @@ pub const SIZE_OF_VERSION: usize = 1;
 pub const SIZE_OF_TYPE: usize = 1;
 
 pub const HEADER_SIZE: usize = SIZE_OF_LENGTH + SIZE_OF_MAGIC + SIZE_OF_VERSION + SIZE_OF_TYPE;
+
+// V5 Constants
+/// How long a V5 consumer waits for a peer that claimed a queue slot to publish it.
+pub const DEFAULT_V5_QUEUE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
+/// `[offset:8][next:8][len:4][cap:4]`
+pub const DYNSHM_BUFFER_HEADER_SIZE: usize = 24;
+/// 4 GiB size of the dynamic shared-memory segment.
+pub const DYNSHM_TOTAL_SIZE: usize = 4 << 30;
+/// 256 KiB max block for the V5 shared-region allocator. A payload a block cannot hold
+/// gets a dedicated region instead, carved in multiples of this size.
+pub const MAX_BLOCK_SIZE: usize = 256 << 10;
+/// Largest frame either side writes to the socket, and the largest a session will read: a
+/// fallback payload this big is read into an allocation of its own, and a header claiming
+/// more is refused.
+pub const MAX_CONTROL_FRAME_SIZE: usize = 256 << 20;
+/// Largest message one DynShm chain carries (1 GiB).
+pub const MAX_DYN_SHM_TRANSFER_SIZE: usize = 1 << 30;
+/// Number of file descriptors sent when eventfd wakeups are enabled.
+pub const MEMFD_COUNT_EVENTFD_V5: usize = 3;
+/// 16 KiB min block for the V5 shared-region allocator.
+pub const MIN_BLOCK_SIZE: usize = 16 << 10;
+/// Bytes the V5 ring header occupies ahead of the slot array: the head and tail cache lines.
+pub const MPSC_HEADER_SIZE: usize = 128;
+/// Granularity every V5 mapping is sized and validated against.
+pub const PAGE_SIZE: usize = 4096;
+/// Bytes the V5 queue header occupies ahead of the ring: the working flag and its padding.
+pub const QUEUE_HEADER_SIZE: usize = 64;
+/// 16 MiB per shared region.
+pub const SHARED_REGION_SIZE: usize = 16 << 20;

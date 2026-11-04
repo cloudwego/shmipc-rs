@@ -141,7 +141,6 @@ impl AsyncWrite for StreamExt {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-
         loop {
             match &mut this.write_state {
                 WriteState::Idle => {
