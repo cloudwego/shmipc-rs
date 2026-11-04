@@ -119,12 +119,11 @@ impl Server {
             }
         }?;
         // 3. ack share memory
-        let mut resp_header = Header([0u8; HEADER_SIZE].as_mut_ptr());
+        let mut resp_buf = [0u8; HEADER_SIZE];
+        let mut resp_header = Header(resp_buf.as_mut_ptr());
         resp_header.encode(HEADER_SIZE as u32, 3, EventType::TYPE_ACK_SHARE_MEMORY);
         protocol_trace(&resp_header, &[], true);
-        block_write_full(self.conn_fd, unsafe {
-            std::slice::from_raw_parts(resp_header.0, HEADER_SIZE)
-        })?;
+        block_write_full(self.conn_fd, &resp_buf)?;
         Ok(ProtocolInitialized::legacy(r, 3))
     }
 }

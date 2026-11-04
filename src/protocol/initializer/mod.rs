@@ -15,12 +15,18 @@
 pub mod v2;
 pub mod v3;
 pub mod v4;
+pub mod v5;
 
 use std::{os::fd::RawFd, sync::Arc};
 
 use anyhow::anyhow;
 
-use self::{v2::ProtocolInitializerV2, v3::ProtocolInitializerV3, v4::ProtocolInitializerV4};
+use self::{
+    v2::ProtocolInitializerV2,
+    v3::ProtocolInitializerV3,
+    v4::ProtocolInitializerV4,
+    v5::{ProtocolInitializerV5, V5Initialized},
+};
 use super::{block_io::block_write_full, event::check_event_valid, header::Header, protocol_trace};
 use crate::{
     buffer::manager::BufferManager,
@@ -38,10 +44,38 @@ pub enum ProtocolInitializer {
     V2(ProtocolInitializerV2),
     V3(ProtocolInitializerV3),
     V4(ProtocolInitializerV4),
+    V5(ProtocolInitializerV5),
+}
+
+/// How the shared memory a handshake produced is laid out, which differs by protocol version.
+pub enum SharedMemoryMode {
+    /// V2 to V4: one buffer pool and one queue pair, both created by the client and mapped by the
+    /// server. `None` on the side that did not create them.
+    SharedPool(Option<(Arc<BufferManager>, QueueManager)>),
+    /// V5: each endpoint creates its own queue and dynamic segment and maps the peer's.
+    PerEndpointPool(Option<Box<V5Initialized>>),
+}
+
+impl SharedMemoryMode {
+    /// Takes the buffer and queue managers of a V2 to V4 session, leaving `None` behind.
+    pub fn take(&mut self) -> Option<(Arc<BufferManager>, QueueManager)> {
+        match self {
+            Self::SharedPool(shared_memory) => shared_memory.take(),
+            Self::PerEndpointPool(_) => None,
+        }
+    }
+
+    /// Takes the queues and dynamic segments of a V5 session, leaving `None` behind.
+    pub fn take_v5(&mut self) -> Option<Box<V5Initialized>> {
+        match self {
+            Self::PerEndpointPool(shared_memory) => shared_memory.take(),
+            Self::SharedPool(_) => None,
+        }
+    }
 }
 
 pub struct ProtocolInitialized {
-    pub shared_memory: Option<(Arc<BufferManager>, QueueManager)>,
+    pub shared_memory: SharedMemoryMode,
     pub proto_version: u8,
     pub msg_version: u8,
     pub feature: NegotiatedFeature,
@@ -50,7 +84,7 @@ pub struct ProtocolInitialized {
 
 impl ProtocolInitialized {
     pub fn new(
-        shared_memory: Option<(Arc<BufferManager>, QueueManager)>,
+        shared_memory: SharedMemoryMode,
         proto_version: u8,
         msg_version: u8,
         feature: NegotiatedFeature,
@@ -67,7 +101,7 @@ impl ProtocolInitialized {
 
     pub fn legacy(shared_memory: Option<(Arc<BufferManager>, QueueManager)>, version: u8) -> Self {
         Self::new(
-            shared_memory,
+            SharedMemoryMode::SharedPool(shared_memory),
             version,
             version,
             NegotiatedFeature::None,
@@ -82,21 +116,21 @@ impl ProtocolInitializer {
             ProtocolInitializer::V2(v2) => v2.init(),
             ProtocolInitializer::V3(v3) => v3.init(),
             ProtocolInitializer::V4(v4) => v4.init(),
+            ProtocolInitializer::V5(v5) => v5.init(),
         }
     }
 }
 
 pub fn handle_exchange_version(conn_fd: RawFd) -> Result<(), anyhow::Error> {
-    let mut resp_header = Header([0; HEADER_SIZE].as_mut_ptr());
+    let mut resp_buf = [0u8; HEADER_SIZE];
+    let mut resp_header = Header(resp_buf.as_mut_ptr());
     resp_header.encode(
         HEADER_SIZE as u32,
         MAX_LEGACY_PROTO_VERSION,
         EventType::TYPE_EXCHANGE_PROTO_VERSION,
     );
     protocol_trace(&resp_header, &[], true);
-    block_write_full(conn_fd, unsafe {
-        std::slice::from_raw_parts(resp_header.0, HEADER_SIZE)
-    })
+    block_write_full(conn_fd, &resp_buf)
 }
 
 pub fn handle_share_memory_by_memfd(
@@ -129,23 +163,8 @@ pub fn handle_share_memory_by_memfd_with_expected(
         .map_err(|err| anyhow!("read shm metadata failed, reason:{}", err))?;
     let (buffer_path, queue_path) = extract_shm_metadata(&body);
 
-    // 2.send AckReadyRecvFD
-    let mut ack = Header([0; HEADER_SIZE].as_mut_ptr());
-    ack.encode(
-        HEADER_SIZE as u32,
-        msg_version,
-        EventType::TYPE_ACK_READY_RECV_FD,
-    );
-    tracing::info!("response typeAckReadyRecvFD");
-    block_write_full(conn_fd, unsafe {
-        std::slice::from_raw_parts(ack.0, HEADER_SIZE)
-    })
-    .map_err(|err| anyhow!("send ack TypeAckReadyRecvFD failed reason:{}", err))?;
-    tracing::info!("TypeAckReadyRecvFD send finished");
-
-    // 3. recv fd
-    tracing::info!("send ack finished");
-    let fds = block_read_out_of_bound_for_fd(conn_fd, expected_fd_count)?;
+    // 2.send AckReadyRecvFD and receive fd
+    let fds = ack_and_recv_fds(conn_fd, msg_version, expected_fd_count)?;
 
     let (buffer_fd, queue_fd) = (fds[0], fds[1]);
     tracing::info!(
@@ -156,7 +175,7 @@ pub fn handle_share_memory_by_memfd_with_expected(
         queue_fd
     );
 
-    // 4. mapping share memory
+    // 3. mapping share memory
     let qm = QueueManager::mapping_with_memfd(queue_path, queue_fd, proto_version)?;
     let bm = BufferManager::get_with_memfd(buffer_path, buffer_fd, 0, false, &mut []).inspect_err(
         |_| {
@@ -210,15 +229,53 @@ pub fn send_memfd_to_peer_with_fds(
     );
     protocol_trace(&h, &event[HEADER_SIZE..], true);
 
-    block_write_full(conn_fd, &event)?;
-    let mut buf = [0u8; HEADER_SIZE];
-    wait_event_header(conn_fd, EventType::TYPE_ACK_READY_RECV_FD, &mut buf)?;
     let mut fds = Vec::with_capacity(MEMFD_COUNT + extra_fds.len());
     fds.push(buffer_fd);
     fds.push(queue_fd);
     fds.extend_from_slice(extra_fds);
-    send_fd(conn_fd, &fds)?;
+    send_shm_metadata_and_fds(conn_fd, &event, &fds)?;
     Ok(None)
+}
+
+/// Hands `fds` to the peer once it has acknowledged `event`.
+///
+/// `event` carries the metadata naming what the descriptors are; the peer answers it with
+/// [`EventType::TYPE_ACK_READY_RECV_FD`] before the descriptors go out of band, so it is never
+/// reading them off a socket it has not prepared for.
+pub fn send_shm_metadata_and_fds(
+    conn_fd: RawFd,
+    event: &[u8],
+    fds: &[RawFd],
+) -> Result<(), anyhow::Error> {
+    block_write_full(conn_fd, event)?;
+    let mut buf = [0u8; HEADER_SIZE];
+    wait_event_header(conn_fd, EventType::TYPE_ACK_READY_RECV_FD, &mut buf)?;
+    send_fd(conn_fd, fds)
+}
+
+/// Tells the peer this side is ready for descriptors and takes the ones it sends.
+///
+/// This is the receiving half of [`send_shm_metadata_and_fds`]; the two must agree on
+/// `expected_fd_count`, which the negotiated feature set decides.
+pub fn ack_and_recv_fds(
+    conn_fd: RawFd,
+    msg_version: u8,
+    expected_fd_count: usize,
+) -> Result<Vec<RawFd>, anyhow::Error> {
+    let mut ack_buf = [0u8; HEADER_SIZE];
+    let mut ack = Header(ack_buf.as_mut_ptr());
+    ack.encode(
+        HEADER_SIZE as u32,
+        msg_version,
+        EventType::TYPE_ACK_READY_RECV_FD,
+    );
+    protocol_trace(&ack, &[], true);
+    tracing::info!("response typeAckReadyRecvFD");
+    block_write_full(conn_fd, &ack_buf)
+        .map_err(|err| anyhow!("send ack TypeAckReadyRecvFD failed reason:{}", err))?;
+    tracing::info!("TypeAckReadyRecvFD send finished");
+
+    block_read_out_of_bound_for_fd(conn_fd, expected_fd_count)
 }
 
 pub fn wait_event_header(

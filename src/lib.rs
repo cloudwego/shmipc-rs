@@ -19,6 +19,7 @@ mod listener;
 mod protocol;
 mod queue;
 mod util;
+mod v5;
 
 pub mod buffer;
 pub mod compact;

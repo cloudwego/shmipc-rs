@@ -100,6 +100,17 @@ benchmark_parallel_ping_pong_by_uds_4194304b
 - [HelloWorldClient](examples/src/hello_world/greeter_client.rs)
 - [HelloWorldServer](examples/src/hello_world/greeter_server.rs)
 
+#### 0.3 breaking changes
+
+- `Buf` and `ShmBuf` no longer take a lifetime parameter: `Buf<'shm>` is now `Buf`. A read result
+  keeps its shared-memory block alive by reference count instead of by borrowing the session, so it
+  can be stored and moved freely. Drop the lifetime from any signature or struct that named it.
+- `ProtocolMode` gained a `V5 { fallback }` variant, so an exhaustive `match` over it needs a new
+  arm.
+- `Config` gained `v5_queue_publish_timeout`, and `Stats` / `StatsSnapshot` gained `v5_*` counters.
+  Struct literals over those types need the new fields, or `..Default::default()`.
+- `MAX_SUPPORT_PROTO_VERSION` is now `5`.
+
 #### 0.2 read API migration
 
 The 0.2 API separates streaming reads from exact contiguous reads:
@@ -114,7 +125,8 @@ The old ambiguous method names are not retained as compatibility aliases.
 #### Protocol configuration
 
 `Config::default()` keeps the legacy behavior: file-path shared memory uses the V2 protocol and
-memfd shared memory uses the V3 protocol. V4 is opt-in through the nested protocol config helpers:
+memfd shared memory uses the V3 protocol. V4 and V5 are opt-in through the nested protocol config
+helpers:
 
 ```rust
 use std::time::Duration;
@@ -125,6 +137,9 @@ let legacy = Config::default();
 let v4 = Config::default().with_v4();
 let v4_eventfd = Config::default().with_v4_eventfd();
 let v4_polling = Config::default().with_v4_event_queue_polling(Duration::from_micros(100));
+let v5 = Config::default().with_v5();
+let v5_eventfd = Config::default().with_v5_eventfd();
+let v5_polling = Config::default().with_v5_event_queue_polling(Duration::from_micros(100));
 
 let sm_config = SessionManagerConfig::new().with_config(v4_eventfd);
 ```
@@ -137,18 +152,26 @@ Mode selection:
 | V4 default | `Config::default().with_v4()` | First V4 rollout step; keeps the Unix-socket polling wakeup path. |
 | V4 eventfd | `Config::default().with_v4_eventfd()` | Recommended V4 mode for low-latency small-message workloads on Linux memfd. |
 | V4 polling | `Config::default().with_v4_event_queue_polling(interval)` | Reduces per-message wakeup traffic; latency is bounded by the negotiated polling interval and OS timer behavior. |
+| V5 default | `Config::default().with_v5()` | First V5 rollout step; keeps the Unix-socket polling wakeup path. |
+| V5 eventfd | `Config::default().with_v5_eventfd()` | Recommended V5 mode for low-latency small-message workloads. |
+| V5 polling | `Config::default().with_v5_event_queue_polling(interval)` | Same trade-off as V4 polling, on the V5 segment model. |
 
 Server-side notes:
 
-- A server using `Config::default()` can accept legacy V2/V3 clients and V4 clients. V4 optional
-  wakeup features are selected from the client request.
+- A server accepts the highest version its client offered, whatever its own mode is, so a server on
+  `Config::default()` serves legacy V2/V3, V4 and V5 clients alike. The server's own mode only
+  decides what that process would ask for if it dialled out. Optional wakeup features are selected
+  from the client request.
 - `eventfd_wakeup` requires memfd shared memory. This is the default `MemMapType`; do not switch the
   server to `MemMapTypeDevShmFile` if clients need V4 eventfd.
-- The polling interval is negotiated from the V4 client request and used by both peers.
+- The polling interval is negotiated from the client request (V4 or V5) and used by both peers.
 - The V4 helpers set `fallback = true`. A client falls back to legacy V3 only when initial V4 setup
   fails with a network/protocol failure. Explicit negotiation rejections are returned as errors.
   Set `config.protocol.mode = ProtocolMode::V4 { fallback: false }` when silent downgrade is not
   desired.
+- The V5 helpers set `fallback = true` as well, but V5 is announced alongside V4 in the same
+  negotiation, so a peer that only speaks V4 settles on V4 without a reconnect. A V5 problem
+  therefore shows as a quiet downgrade rather than an error; check `Stream::v5_dynshm_stats()`.
 
 The example server can be used with the V4 clients:
 
@@ -165,6 +188,35 @@ cargo run -p examples --bin greeter_client_v4_eventfd
 cargo run -p examples --bin greeter_client_v4_polling
 ```
 
+#### V5
+
+V5 uses the same `Stream` API as V4. Reads, writes, flush and close are unchanged, and the mode
+helpers mirror the V4 ones one for one, so nothing above needs redoing. What differs is the memory
+model:
+
+- Each side owns its queue and its own dynamic segment instead of both sharing one buffer pool, so
+  a slow reader can no longer starve the writer's allocator.
+- Buffers are allocated per message and returned once the peer has read them, so the segment grows
+  and shrinks with load rather than being sized up front.
+- A payload that fits the largest shared block is served from a shared region and chained onto the
+  message; anything larger in a *single* `write_bytes` call gets a dedicated region of its own. The
+  split is decided per call, not per message.
+
+V5 requires memfd shared memory, which is the default `MemMapType`; `Config::verify()` rejects V5
+on `MemMapTypeDevShmFile`. `Stream::v5_dynshm_stats()` reports this side's own region usage and
+returns `None` on a session that did not negotiate V5.
+
+The V5 example is a self-checking round trip rather than a greeter: it drives payloads either side
+of the shared/dedicated split, verifies every echo byte for byte, and prints the segment counters.
+
+- [V5 client](examples/src/v5/client.rs)
+- [V5 server](examples/src/v5/server.rs)
+
+```bash
+cargo run -p examples --bin v5_server
+cargo run -p examples --bin v5_client
+```
+
 When constructing `Config` with a struct literal, include `protocol` explicitly or use
 `..Config::default()` so future config fields keep their defaults.
 
@@ -175,3 +227,7 @@ been attempted. It does not mean that the peer has already drained the shared-me
 the bytes. `SessionManager::close()` and listener/session close paths are hard closes. If the last
 application frame must be delivered before shutdown, use an application-level acknowledgement or
 completion barrier before closing the session.
+
+## License
+
+Shmipc is distributed under the [Apache License, version 2.0](LICENSE).

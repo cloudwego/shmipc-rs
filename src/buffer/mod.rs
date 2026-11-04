@@ -13,12 +13,14 @@
 // limitations under the License.
 
 mod buf;
+mod buf_v5;
 pub mod linked;
 pub mod list;
 pub mod manager;
 pub mod slice;
 
 pub use buf::{Buf, ShmBuf};
+pub use buf_v5::{OutChunk, V5Inbox, V5Outgoing, V5ReadBuffer, V5WriteBuffer};
 pub use linked::LinkedBuffer;
 pub use slice::BufferSlice;
 
@@ -29,13 +31,13 @@ pub trait BufferReader {
     ///
     /// A zero-copy result pins its underlying slice until the returned [`Buf`] (or the
     /// [`bytes::Bytes`] created by [`Buf::into_bytes`]) is dropped.
-    fn read_chunk(&mut self) -> Result<Buf<'_>, Error>;
+    fn read_chunk(&mut self) -> Result<Buf, Error>;
 
     /// Read `size` bytes from shared memory.
     ///
     /// A zero-copy result pins its underlying slice until the returned [`Buf`] (or the
     /// [`bytes::Bytes`] created by [`Buf::into_bytes`]) is dropped.
-    fn read_exact_bytes(&mut self, size: usize) -> Result<Buf<'_>, Error>;
+    fn read_exact_bytes(&mut self, size: usize) -> Result<Buf, Error>;
 
     /// Peek `size` byte from share memory.
     ///
@@ -44,7 +46,7 @@ pub trait BufferReader {
     ///
     /// A zero-copy result remains valid for its own lifetime, including across
     /// [`BufferReader::release_previous_read`].
-    fn peek(&mut self, size: usize) -> Result<Buf<'_>, Error>;
+    fn peek(&mut self, size: usize) -> Result<Buf, Error>;
 
     /// Drop data of given size.
     fn discard(&mut self, size: usize) -> Result<usize, Error>;

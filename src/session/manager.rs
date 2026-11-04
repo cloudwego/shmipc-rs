@@ -78,14 +78,14 @@ where
 {
     /// Create a new SessionManager.
     pub async fn new(
-        mut sm_config: SessionManagerConfig,
+        sm_config: SessionManagerConfig,
         connect: C,
         addr: C::Address,
     ) -> Result<Self, Error> {
         let mut sessions = Vec::with_capacity(sm_config.session_num());
 
         for i in 0..sm_config.session_num() {
-            let session = Session::client(i, 0, 0, &mut sm_config, &connect, addr.clone()).await?;
+            let session = Session::client(i, 0, 0, &sm_config, &connect, addr.clone()).await?;
             sessions.push(ArcSwap::from_pointee(session));
         }
         let shutdown = Arc::new(Notify::new());
@@ -165,13 +165,17 @@ where
             }
 
             loop {
-                tokio::time::sleep(self.inner.sm_config.config().rebuild_interval).await;
+                let wait = tokio::time::sleep(self.inner.sm_config.config().rebuild_interval);
+                match futures::future::select(std::pin::pin!(wait), &mut shutdown_rx).await {
+                    Either::Left(_) => {}
+                    Either::Right(_) => return,
+                }
 
                 match Session::client(
                     i,
                     0,
                     0,
-                    &mut self.inner.sm_config.clone(),
+                    &self.inner.sm_config,
                     &self.inner.connect,
                     self.inner.addr.clone(),
                 )
