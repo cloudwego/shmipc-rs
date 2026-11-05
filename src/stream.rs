@@ -656,7 +656,7 @@ impl Stream {
     /// Hand a data frame to the stream, for a reader to pick up.
     ///
     /// V2 to V4 only. A V5 stream is delivered into through its inbox, by
-    /// [`Stream::fill_fallback_to_read_buffer`] or by the event loop's own batches.
+    /// `Stream::fill_fallback_to_read_buffer` or by the event loop's own batches.
     pub fn fill_data_to_read_buffer(&self, data: BufferSliceWrapper) -> Result<(), Error> {
         let RecvSide::V4 { buf, pending } = &self.inner.recv else {
             return Err(Error::BrokenBuffer);

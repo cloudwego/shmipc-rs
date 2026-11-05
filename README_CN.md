@@ -215,7 +215,3 @@ cargo run -p examples --bin v5_client
 对端已经 drain 共享内存队列或已经读到这些字节。`SessionManager::close()` 以及 listener/session
 关闭路径是 hard close。如果应用要求最后一帧在关闭前一定被对端读到，需要在关闭 session 前做应用层
 ack 或 completion barrier。
-
-## 许可证
-
-Shmipc 基于 [Apache License 2.0](LICENSE) 开源。
