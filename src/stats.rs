@@ -14,6 +14,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use crate::v5::dynshm::Stats as DynShmStats;
+
 #[derive(Debug, Default)]
 pub struct Stats {
     #[allow(dead_code)]
@@ -26,6 +28,12 @@ pub struct Stats {
     pub send_polling_event_count: AtomicU64,
     pub out_flow_bytes: AtomicU64,
     pub in_flow_bytes: AtomicU64,
+
+    pub v5_alloc_dynshm_error_count: AtomicU64,
+    pub v5_send_queue_full_count: AtomicU64,
+    pub v5_read_copy_count: AtomicU64,
+    pub v5_send_queue_count: AtomicU64,
+    pub v5_recv_queue_count: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,6 +47,12 @@ pub struct StatsSnapshot {
     pub send_polling_event_count: u64,
     pub out_flow_bytes: u64,
     pub in_flow_bytes: u64,
+
+    pub v5_alloc_dynshm_error_count: u64,
+    pub v5_send_queue_full_count: u64,
+    pub v5_read_copy_count: u64,
+    pub v5_send_queue_count: u64,
+    pub v5_recv_queue_count: u64,
 }
 
 impl Stats {
@@ -53,6 +67,11 @@ impl Stats {
             send_polling_event_count: self.send_polling_event_count.load(Ordering::Relaxed),
             out_flow_bytes: self.out_flow_bytes.load(Ordering::Relaxed),
             in_flow_bytes: self.in_flow_bytes.load(Ordering::Relaxed),
+            v5_alloc_dynshm_error_count: self.v5_alloc_dynshm_error_count.load(Ordering::Relaxed),
+            v5_send_queue_full_count: self.v5_send_queue_full_count.load(Ordering::Relaxed),
+            v5_read_copy_count: self.v5_read_copy_count.load(Ordering::Relaxed),
+            v5_send_queue_count: self.v5_send_queue_count.load(Ordering::Relaxed),
+            v5_recv_queue_count: self.v5_recv_queue_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -83,6 +102,21 @@ impl StatsSnapshot {
                 .saturating_sub(rhs.send_polling_event_count),
             out_flow_bytes: self.out_flow_bytes.saturating_sub(rhs.out_flow_bytes),
             in_flow_bytes: self.in_flow_bytes.saturating_sub(rhs.in_flow_bytes),
+            v5_alloc_dynshm_error_count: self
+                .v5_alloc_dynshm_error_count
+                .saturating_sub(rhs.v5_alloc_dynshm_error_count),
+            v5_send_queue_full_count: self
+                .v5_send_queue_full_count
+                .saturating_sub(rhs.v5_send_queue_full_count),
+            v5_read_copy_count: self
+                .v5_read_copy_count
+                .saturating_sub(rhs.v5_read_copy_count),
+            v5_send_queue_count: self
+                .v5_send_queue_count
+                .saturating_sub(rhs.v5_send_queue_count),
+            v5_recv_queue_count: self
+                .v5_recv_queue_count
+                .saturating_sub(rhs.v5_recv_queue_count),
         }
     }
 
@@ -110,5 +144,20 @@ impl StatsSnapshot {
             .saturating_add(rhs.send_polling_event_count);
         self.out_flow_bytes = self.out_flow_bytes.saturating_add(rhs.out_flow_bytes);
         self.in_flow_bytes = self.in_flow_bytes.saturating_add(rhs.in_flow_bytes);
+        self.v5_alloc_dynshm_error_count = self
+            .v5_alloc_dynshm_error_count
+            .saturating_add(rhs.v5_alloc_dynshm_error_count);
+        self.v5_send_queue_full_count = self
+            .v5_send_queue_full_count
+            .saturating_add(rhs.v5_send_queue_full_count);
+        self.v5_read_copy_count = self
+            .v5_read_copy_count
+            .saturating_add(rhs.v5_read_copy_count);
+        self.v5_send_queue_count = self
+            .v5_send_queue_count
+            .saturating_add(rhs.v5_send_queue_count);
+        self.v5_recv_queue_count = self
+            .v5_recv_queue_count
+            .saturating_add(rhs.v5_recv_queue_count);
     }
 }

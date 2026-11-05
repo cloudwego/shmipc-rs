@@ -22,7 +22,7 @@ use tokio::io::ReadBuf;
 
 use super::{
     BufferReader, BufferWriter,
-    buf::{Buf, ShmBuf},
+    buf::{Buf, PinLease, ShmBuf},
 };
 use crate::{
     buffer::{
@@ -66,7 +66,7 @@ impl PinRegistry {
             });
             state
         };
-        PinLease { _state: state }
+        PinLease::V4(state)
     }
 
     fn is_pinned(&self, slice: &BufferSlice) -> bool {
@@ -105,7 +105,7 @@ impl PinRegistry {
 }
 
 #[derive(Debug)]
-struct SlicePinState {
+pub(crate) struct SlicePinState {
     buffer_manager: Arc<BufferManager>,
     retired_slice: Mutex<Option<BufferSlice>>,
 }
@@ -144,10 +144,6 @@ fn reclaim_slice(buffer_manager: &BufferManager, slice: BufferSlice) {
             _ = Vec::from_raw_parts(slice.data, slice.cap as usize, slice.cap as usize);
         }
     }
-}
-
-pub(crate) struct PinLease {
-    _state: Arc<SlicePinState>,
 }
 
 #[derive(Debug)]
@@ -357,7 +353,7 @@ impl LinkedBuffer {
 
     pub(crate) fn read_available_into(
         &mut self,
-        dst: &mut ReadBuf<'_>,
+        dst: &mut ReadBuf,
         max_slices: usize,
     ) -> Result<usize, Error> {
         if dst.remaining() == 0 {
@@ -411,7 +407,7 @@ impl LinkedBuffer {
 }
 
 impl BufferReader for LinkedBuffer {
-    fn read_chunk(&mut self) -> Result<Buf<'_>, Error> {
+    fn read_chunk(&mut self) -> Result<Buf, Error> {
         let recycle_mux = self.recycle_mux.clone();
         let _unused = recycle_mux.lock().unwrap();
 
@@ -435,10 +431,12 @@ impl BufferReader for LinkedBuffer {
         let lease = self.pin_registry.acquire(self.slice_list.front().unwrap());
         self.len -= size;
         let bytes = self.slice_list.front_mut().unwrap().read(size);
-        Ok(Buf::Shm(ShmBuf::new(bytes, lease)))
+        Ok(Buf::Shm(unsafe {
+            ShmBuf::new(bytes.as_ptr(), bytes.len(), lease)
+        }))
     }
 
-    fn read_exact_bytes(&mut self, mut size: usize) -> Result<Buf<'_>, Error> {
+    fn read_exact_bytes(&mut self, mut size: usize) -> Result<Buf, Error> {
         if size == 0 {
             return Ok(Buf::Exm(Bytes::new()));
         }
@@ -464,7 +462,9 @@ impl BufferReader for LinkedBuffer {
             self.len -= size;
             // A workaround to avoid https://github.com/rust-lang/rust/issues/54663
             let bytes = self.slice_list.front_mut().unwrap().read(size);
-            return Ok(Buf::Shm(ShmBuf::new(bytes, lease)));
+            return Ok(Buf::Shm(unsafe {
+                ShmBuf::new(bytes.as_ptr(), bytes.len(), lease)
+            }));
         }
         // slow path
         self.len -= size;
@@ -484,7 +484,7 @@ impl BufferReader for LinkedBuffer {
         Ok(Buf::Exm(result.freeze()))
     }
 
-    fn peek(&mut self, mut size: usize) -> Result<Buf<'_>, Error> {
+    fn peek(&mut self, mut size: usize) -> Result<Buf, Error> {
         if size == 0 {
             return Ok(Buf::Exm(Bytes::new()));
         }
@@ -498,7 +498,9 @@ impl BufferReader for LinkedBuffer {
             let lease = self.pin_registry.acquire(slice);
             let read_bytes = slice.peek(size);
             if read_bytes.len() == size {
-                return Ok(Buf::Shm(ShmBuf::new(read_bytes, lease)));
+                return Ok(Buf::Shm(unsafe {
+                    ShmBuf::new(read_bytes.as_ptr(), size, lease)
+                }));
             }
             drop(lease);
         }

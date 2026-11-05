@@ -134,6 +134,9 @@ pub enum Error {
     #[error("the queue is full")]
     QueueFull,
 
+    #[error("the peer did not publish a claimed queue slot in time")]
+    QueuePublishTimeout,
+
     #[error("stream pool is full")]
     StreamPoolFull,
 
@@ -181,6 +184,7 @@ impl From<Error> for io::Error {
             Error::FileNameTooLong => io::Error::new(io::ErrorKind::InvalidInput, value),
             Error::QueueEmpty => io::Error::new(io::ErrorKind::ResourceBusy, value),
             Error::QueueFull => io::Error::new(io::ErrorKind::ResourceBusy, value),
+            Error::QueuePublishTimeout => io::Error::new(io::ErrorKind::TimedOut, value),
             Error::StreamPoolFull => io::Error::new(io::ErrorKind::ResourceBusy, value),
             Error::StreamHasUnreadData(_) => io::Error::other(value),
             Error::StreamHasPendingData(_) => io::Error::other(value),

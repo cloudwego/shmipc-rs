@@ -30,8 +30,8 @@ async fn main() {
     conf.config_mut().share_memory_path_prefix = "/dev/shm/client.ipc.shm".to_string();
     #[cfg(target_os = "macos")]
     {
-        conf.config.share_memory_path_prefix = "/tmp/client.ipc.shm".to_string();
-        conf.config.queue_path = "/tmp/client.ipc.shm_queue".to_string();
+        conf.config_mut().share_memory_path_prefix = "/tmp/client.ipc.shm".to_string();
+        conf.config_mut().queue_path = "/tmp/client.ipc.shm_queue".to_string();
     }
 
     let sm = SessionManager::new(conf, DefaultUnixConnect, uds_path)

@@ -26,7 +26,17 @@ macro_rules! ready {
 }
 
 impl<R: AsyncRead + Unpin> BufReader<R> {
+    /// Returns at least `len` buffered bytes, reading more as needed.
+    ///
+    /// The buffer never grows, so `len` has to fit it: anything larger is an error rather than
+    /// a panic, since `len` usually comes from a length field the peer wrote. A payload too big
+    /// to buffer is read straight into its own allocation with
+    /// [`read_exact`](AsyncReadExt::read_exact) instead, which drains what is buffered first.
     pub async fn fill_buf_at_least(&mut self, len: usize) -> io::Result<&[u8]> {
+        if self.pos == self.len {
+            self.compact();
+        }
+
         if len == 0 {
             return Ok(&[]);
         }
@@ -35,7 +45,12 @@ impl<R: AsyncRead + Unpin> BufReader<R> {
             return Ok(&self.buf[self.pos..self.len]);
         }
 
-        assert!(len <= self.cap);
+        if len > self.cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{len} bytes do not fit the {} byte read buffer", self.cap),
+            ));
+        }
         // if the requested length is larger than the buffer, we need to compact the buffer
         if len > (self.cap - self.pos) {
             self.compact();

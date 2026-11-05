@@ -223,22 +223,14 @@ fn benchmark_config() -> SessionManagerConfig {
     c
 }
 
+/// A flush the queue refuses drops the message, so it is written again before the next try.
 async fn must_write(s: &mut Stream, size: u32) {
-    write_empty_buffer(s.send_buf(), size);
     loop {
+        write_empty_buffer(s.send_buf(), size);
         match s.flush(false).await {
-            Err(e) => match e {
-                Error::QueueFull => {
-                    tokio::time::sleep(std::time::Duration::from_micros(1)).await;
-                    continue;
-                }
-                _ => {
-                    panic!("must write err:{}", e);
-                }
-            },
-            Ok(_) => {
-                return;
-            }
+            Ok(()) => return,
+            Err(Error::QueueFull) => tokio::time::sleep(std::time::Duration::from_micros(1)).await,
+            Err(err) => panic!("must write err:{err}"),
         }
     }
 }
