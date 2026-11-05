@@ -155,14 +155,14 @@ impl Drop for Shared {
     }
 }
 
-/// What the read loop does after [`Session::handle_events`] has consumed what it could.
+/// What the read loop does after `Session::handle_events` has consumed what it could.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
     /// Have at least this many bytes buffered before parsing again.
     Fill(usize),
     /// A fallback frame's headers have been consumed. Read its payload of `len` bytes straight
     /// into an allocation of its own, then hand it to
-    /// [`Session::handle_fallback_payload`].
+    /// `Session::handle_fallback_payload`.
     FallbackPayload {
         seq_id: u32,
         status: u32,

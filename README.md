@@ -227,7 +227,3 @@ been attempted. It does not mean that the peer has already drained the shared-me
 the bytes. `SessionManager::close()` and listener/session close paths are hard closes. If the last
 application frame must be delivered before shutdown, use an application-level acknowledgement or
 completion barrier before closing the session.
-
-## License
-
-Shmipc is distributed under the [Apache License, version 2.0](LICENSE).

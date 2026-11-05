@@ -279,7 +279,7 @@ pub struct LocalManager {
     debug: bool,
 }
 
-/// Memory usage across a [`LocalManager`]'s regions.
+/// Memory usage across a `LocalManager`'s regions.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
     /// Release notifications waiting to be drained.
